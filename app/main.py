@@ -5,7 +5,7 @@ import logging
 
 from app.db.mongodb import connect_to_mongo, close_mongo_connection
 from app.db.qdrant import connect_to_qdrant
-from app.api.documents import router as documents_router
+from app.api.document import router as documents_router
 
 # Configure logging
 logging.basicConfig(
@@ -37,7 +37,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:4000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
