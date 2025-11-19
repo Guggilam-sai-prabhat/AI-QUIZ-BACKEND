@@ -7,9 +7,14 @@ import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 import logging
-import fitz  # ✅ PyMuPDF
-from app.models.document import DocumentMetadata, DocumentResponse
+import fitz  # PyMuPDF
+from app.models.document import DocumentMetadata, DocumentResponse, EmbeddingResponse
 from app.db.mongodb import get_collection
+
+# Import chunking, embedding, and vector services
+from app.services.text_chunker import chunk_text, get_chunk_stats
+from app.services.embedding_service import get_embeddings, get_embedding_dimension
+from app.services.qdrant_service import get_qdrant_service
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -22,6 +27,12 @@ UPLOAD_DIR = "uploads"
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 ALLOWED_EXTENSIONS = {".pdf"}
 ALLOWED_MIME_TYPES = {"application/pdf"}
+
+# Vector pipeline configuration
+CHUNK_SIZE = 500  # tokens
+CHUNK_OVERLAP = 50  # tokens
+EMBEDDING_MODEL = "sentence-transformers"  # or "openai"
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"  # Default for sentence-transformers
 
 # Ensure upload directory exists
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -117,11 +128,162 @@ def extract_text_from_pdf(file_path: str) -> tuple[str, int]:
         raise Exception(f"PDF processing error: {str(e)}")
 
 
+async def process_embeddings_pipeline(
+    document_id: str,
+    extracted_text: str,
+    chunk_size: int = CHUNK_SIZE,
+    chunk_overlap: int = CHUNK_OVERLAP
+) -> dict:
+    """
+    Process the complete embeddings pipeline:
+    1. Chunk text
+    2. Generate embeddings
+    3. Store in Qdrant
+    4. Update MongoDB with chunk_count
+    
+    Args:
+        document_id: MongoDB document ID
+        extracted_text: Text extracted from PDF
+        chunk_size: Token size per chunk
+        chunk_overlap: Overlapping tokens between chunks
+    
+    Returns:
+        Dictionary with pipeline results
+    """
+    try:
+        logger.info(f"🔄 Starting embedding pipeline for document {document_id}")
+        
+        # Step 1: Chunk the text
+        logger.info(f"📝 Step 1: Chunking text ({len(extracted_text)} chars)")
+        chunks = chunk_text(
+            text=extracted_text,
+            chunk_size=chunk_size,
+            overlap=chunk_overlap
+        )
+        
+        if not chunks:
+            logger.warning(f"⚠️ No chunks generated for document {document_id}")
+            return {
+                "material_id": document_id,
+                "chunk_count": 0,
+                "status": "no_content"
+            }
+        
+        # Get chunk statistics
+        stats = get_chunk_stats(extracted_text, chunks)
+        logger.info(
+            f"✅ Created {len(chunks)} chunks "
+            f"(avg: {stats['avg_chunk_tokens']:.0f} tokens, "
+            f"range: {stats['min_chunk_tokens']}-{stats['max_chunk_tokens']})"
+        )
+        
+        # Step 2: Generate embeddings
+        logger.info(f"🧠 Step 2: Generating embeddings ({EMBEDDING_MODEL})")
+        embeddings = get_embeddings(
+            chunks=chunks,
+            model=EMBEDDING_MODEL,
+            model_name=EMBEDDING_MODEL_NAME
+        )
+        
+        if len(embeddings) != len(chunks):
+            raise ValueError(
+                f"Embedding count mismatch: {len(embeddings)} embeddings "
+                f"for {len(chunks)} chunks"
+            )
+        
+        embedding_dim = len(embeddings[0]) if embeddings else 0
+        logger.info(f"✅ Generated {len(embeddings)} embeddings (dim: {embedding_dim})")
+        
+        # Step 3: Store in Qdrant
+        logger.info(f"💾 Step 3: Storing vectors in Qdrant")
+        vector_service = get_qdrant_service()
+        
+        # Ensure collection exists with correct dimension
+        vector_service.ensure_collection(vector_size=embedding_dim)
+        
+        # Upsert embeddings
+        upsert_result = await vector_service.upsert_embeddings(
+            material_id=document_id,
+            chunks=chunks,
+            embeddings=embeddings
+        )
+        
+        if upsert_result["status"] != "success":
+            raise Exception(f"Vector upsert failed: {upsert_result.get('error')}")
+        
+        logger.info(
+            f"✅ Stored {upsert_result['chunks_upserted']} vectors in Qdrant"
+        )
+        
+        # Step 4: Update MongoDB with chunk_count
+        logger.info(f"📊 Step 4: Updating MongoDB document")
+        collection = get_collection("documents")
+        from bson import ObjectId
+        
+        update_result = await collection.update_one(
+            {"_id": ObjectId(document_id)},
+            {
+                "$set": {
+                    "chunk_count": len(chunks),
+                    "embedding_model": EMBEDDING_MODEL,
+                    "embedding_model_name": EMBEDDING_MODEL_NAME,
+                    "embedding_dimension": embedding_dim,
+                    "indexed_at": datetime.now(timezone.utc)
+                }
+            }
+        )
+        
+        if update_result.modified_count == 0:
+            logger.warning(f"⚠️ MongoDB document not updated for {document_id}")
+        else:
+            logger.info(f"✅ MongoDB document updated with chunk_count={len(chunks)}")
+        
+        # Return success result
+        return {
+            "material_id": document_id,
+            "chunk_count": len(chunks),
+            "embedding_dimension": embedding_dim,
+            "status": "embedded",
+            "stats": {
+                "total_chunks": len(chunks),
+                "avg_chunk_tokens": stats['avg_chunk_tokens'],
+                "total_tokens": stats['total_chunk_tokens']
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Embedding pipeline failed for {document_id}: {str(e)}")
+        
+        # Update MongoDB with error status
+        try:
+            collection = get_collection("documents")
+            from bson import ObjectId
+            await collection.update_one(
+                {"_id": ObjectId(document_id)},
+                {
+                    "$set": {
+                        "embedding_status": "failed",
+                        "embedding_error": str(e),
+                        "embedding_attempted_at": datetime.now(timezone.utc)
+                    }
+                }
+            )
+        except Exception as update_error:
+            logger.error(f"Failed to update error status: {update_error}")
+        
+        return {
+            "material_id": document_id,
+            "chunk_count": 0,
+            "status": "error",
+            "error": str(e)
+        }
+
+
 @router.get("/health")
 async def health_check():
     """
     Comprehensive health check endpoint
-    Checks MongoDB connection and upload directory
+    Checks MongoDB, Qdrant, and upload directory
     """
     health_status = {
         "status": "ok",
@@ -140,6 +302,18 @@ async def health_check():
         health_status["status"] = "degraded"
         logger.error(f"MongoDB health check failed: {str(e)}")
     
+    # Check Qdrant connection
+    try:
+        vector_service = get_qdrant_service()
+        is_healthy = vector_service.health_check()
+        health_status["checks"]["qdrant"] = "connected" if is_healthy else "disconnected"
+        if not is_healthy:
+            health_status["status"] = "degraded"
+    except Exception as e:
+        health_status["checks"]["qdrant"] = "error"
+        health_status["status"] = "degraded"
+        logger.error(f"Qdrant health check failed: {str(e)}")
+    
     # Check upload directory
     try:
         is_writable = os.access(UPLOAD_DIR, os.W_OK)
@@ -154,10 +328,18 @@ async def health_check():
     return health_status
 
 
-@router.post("/upload", response_model=DocumentResponse)
+@router.post("/upload", response_model=EmbeddingResponse)
 async def upload_document(file: UploadFile = File(...)):
-    """Upload a PDF document with text extraction and duplicate detection"""
+    """
+    Upload a PDF document with complete vector embedding pipeline:
+    1. Extract text from PDF
+    2. Chunk text into manageable pieces
+    3. Generate embeddings for each chunk
+    4. Store vectors in Qdrant
+    5. Update MongoDB with chunk count
+    """
     file_path = None
+    document_id = None
     
     try:
         # Validate file extension
@@ -209,35 +391,34 @@ async def upload_document(file: UploadFile = File(...)):
             os.remove(file_path)
             logger.info(f"🗑️  Removed duplicate file: {file_path}")
             
-            # Return the existing document
-            return DocumentResponse(
+            # Return the existing document with embedding info
+            return EmbeddingResponse(
                 id=str(existing_doc["_id"]),
                 filename=existing_doc["filename"],
                 file_size=existing_doc["file_size"],
                 content_type=existing_doc["content_type"],
                 file_hash=existing_doc["file_hash"],
-                extracted_text=existing_doc.get("extracted_text"),
-                page_count=existing_doc.get("page_count"),
-                uploaded_at=existing_doc["uploaded_at"]
+                uploaded_at=existing_doc["uploaded_at"],
+                material_id=str(existing_doc["_id"]),
+                chunk_count=existing_doc.get("chunk_count", 0),
+                status=existing_doc.get("embedding_status", "unknown")
             )
         
         logger.info(f"✅ No duplicate found. Proceeding with new upload.")
         
-        # ✅ EXTRACT TEXT FROM PDF
+        # Extract text from PDF
         try:
             extracted_text, page_count = extract_text_from_pdf(file_path)
             logger.info(f"✅ Text extraction successful: {page_count} pages, {len(extracted_text)} chars")
         except ValueError as ve:
             # Handle empty or invalid PDFs
             logger.error(f"❌ PDF validation failed: {str(ve)}")
-            # Clean up file
             if os.path.exists(file_path):
                 os.remove(file_path)
             raise HTTPException(status_code=400, detail=str(ve))
         except Exception as e:
             # Handle other PDF processing errors
             logger.error(f"❌ PDF processing failed: {str(e)}")
-            # Clean up file
             if os.path.exists(file_path):
                 os.remove(file_path)
             raise HTTPException(
@@ -255,8 +436,8 @@ async def upload_document(file: UploadFile = File(...)):
             file_size=file_size,
             content_type=file.content_type or "application/pdf",
             file_hash=file_hash,
-            extracted_text=extracted_text,  # ✅ NEW
-            page_count=page_count  # ✅ NEW
+            extracted_text=extracted_text,
+            page_count=page_count
         )
         
         # Store in MongoDB
@@ -264,28 +445,53 @@ async def upload_document(file: UploadFile = File(...)):
             document.model_dump(by_alias=True, exclude=["id"])
         )
         
-        logger.info(f"✅ New document inserted with ID: {result.inserted_id}")
+        document_id = str(result.inserted_id)
+        logger.info(f"✅ New document inserted with ID: {document_id}")
         
-        # Return response
-        return DocumentResponse(
-            id=str(result.inserted_id),
+        # Process embedding pipeline
+        logger.info(f"🚀 Starting embedding pipeline for document {document_id}")
+        embedding_result = await process_embeddings_pipeline(
+            document_id=document_id,
+            extracted_text=extracted_text,
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP
+        )
+        
+        # Return comprehensive response
+        return EmbeddingResponse(
+            id=document_id,
             filename=document.filename,
             file_size=document.file_size,
             content_type=document.content_type,
             file_hash=document.file_hash,
-            uploaded_at=document.uploaded_at
+            uploaded_at=document.uploaded_at,
+            material_id=embedding_result["material_id"],
+            chunk_count=embedding_result["chunk_count"],
+            status=embedding_result["status"],
+            embedding_stats=embedding_result.get("stats")
         )
         
     except HTTPException:
         raise
         
     except Exception as e:
+        # Cleanup on error
         if file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
                 logger.info(f"Cleaned up file after error: {file_path}")
             except Exception as cleanup_error:
                 logger.error(f"Failed to cleanup file: {cleanup_error}")
+        
+        # Try to delete from MongoDB if document was created
+        if document_id:
+            try:
+                collection = get_collection("documents")
+                from bson import ObjectId
+                await collection.delete_one({"_id": ObjectId(document_id)})
+                logger.info(f"Cleaned up MongoDB document: {document_id}")
+            except Exception as cleanup_error:
+                logger.error(f"Failed to cleanup MongoDB document: {cleanup_error}")
         
         logger.error(f"Upload failed: {str(e)}", exc_info=True)
         raise HTTPException(
@@ -296,7 +502,7 @@ async def upload_document(file: UploadFile = File(...)):
 
 @router.get("/debug/document/{document_id}")
 async def debug_document(document_id: str):
-    """Debug endpoint to see raw document data"""
+    """Debug endpoint to see raw document data including embedding info"""
     from bson import ObjectId
     
     try:
@@ -308,6 +514,12 @@ async def debug_document(document_id: str):
         
         # Convert ObjectId to string for JSON serialization
         doc["_id"] = str(doc["_id"])
+        
+        # Exclude extracted_text for brevity (can be very long)
+        if "extracted_text" in doc:
+            doc["extracted_text_length"] = len(doc["extracted_text"])
+            doc["extracted_text_preview"] = doc["extracted_text"][:500] + "..."
+            del doc["extracted_text"]
         
         return doc
     except Exception as e:
@@ -344,8 +556,6 @@ async def get_materials(
                     file_size=doc["file_size"],
                     content_type=doc["content_type"],
                     file_hash=doc.get("file_hash", "unknown"),
-                    extracted_text=doc.get("extracted_text"),  # ✅ NEW
-                    page_count=doc.get("page_count"),  # ✅ NEW
                     uploaded_at=doc["uploaded_at"]
                 )
             )
@@ -387,8 +597,8 @@ async def get_material(document_id: str):
             file_size=doc["file_size"],
             content_type=doc["content_type"],
             file_hash=doc.get("file_hash", "unknown"),
-            extracted_text=doc.get("extracted_text"),  # ✅ NEW
-            page_count=doc.get("page_count"),  # ✅ NEW
+            extracted_text=doc.get("extracted_text"),
+            page_count=doc.get("page_count"),
             uploaded_at=doc["uploaded_at"]
         )
         
@@ -405,7 +615,7 @@ async def get_material(document_id: str):
 @router.delete("/materials/{document_id}")
 async def delete_material(document_id: str):
     """
-    Delete a document by ID
+    Delete a document by ID (includes cleanup of vectors from Qdrant)
     
     Args:
         document_id: MongoDB ObjectId of the document
@@ -423,6 +633,15 @@ async def delete_material(document_id: str):
         
         if not doc:
             raise HTTPException(status_code=404, detail="Document not found")
+        
+        # Delete vectors from Qdrant
+        try:
+            vector_service = get_qdrant_service()
+            await vector_service.delete_material_embeddings(document_id)
+            logger.info(f"✅ Deleted vectors from Qdrant for document {document_id}")
+        except Exception as e:
+            logger.error(f"⚠️ Failed to delete vectors from Qdrant: {str(e)}")
+            # Continue with deletion even if vector cleanup fails
         
         # Delete file from disk
         file_path = doc.get("file_path")
@@ -478,64 +697,23 @@ async def get_materials_count():
         )
 
 
-@router.post("/admin/migrate-hashes")
-async def migrate_file_hashes():
+@router.get("/vectors/stats")
+async def get_vector_stats():
     """
-    Migration endpoint: Add file_hash to existing documents that don't have it
-    Run this once to update old documents
+    Get statistics about the vector collection in Qdrant
+    
+    Returns:
+        Collection statistics including point count and configuration
     """
-    collection = get_collection("documents")
-    
-    # Find documents without file_hash
-    cursor = collection.find({"file_hash": {"$exists": False}})
-    
-    updated_count = 0
-    failed_count = 0
-    results = []
-    
-    async for doc in cursor:
-        file_path = doc.get("file_path")
-        doc_id = str(doc["_id"])
+    try:
+        vector_service = get_qdrant_service()
+        stats = vector_service.get_collection_stats()
         
-        if file_path and os.path.exists(file_path):
-            try:
-                # Calculate hash
-                file_hash = calculate_file_hash(file_path)
-                
-                # Update document
-                await collection.update_one(
-                    {"_id": doc["_id"]},
-                    {"$set": {"file_hash": file_hash}}
-                )
-                
-                updated_count += 1
-                logger.info(f"✅ Added hash to {doc_id}: {file_hash}")
-                results.append({
-                    "id": doc_id,
-                    "status": "success",
-                    "hash": file_hash
-                })
-                
-            except Exception as e:
-                failed_count += 1
-                logger.error(f"❌ Failed to hash {file_path}: {str(e)}")
-                results.append({
-                    "id": doc_id,
-                    "status": "failed",
-                    "error": str(e)
-                })
-        else:
-            failed_count += 1
-            logger.warning(f"⚠️ File not found: {file_path}")
-            results.append({
-                "id": doc_id,
-                "status": "file_not_found",
-                "file_path": file_path
-            })
-    
-    return {
-        "message": "Migration complete",
-        "updated": updated_count,
-        "failed": failed_count,
-        "details": results
-    }
+        return stats
+        
+    except Exception as e:
+        logger.error(f"Failed to get vector stats: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to retrieve vector statistics"
+        )

@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 import logging
 
 from app.db.mongodb import connect_to_mongo, close_mongo_connection
-from app.db.qdrant import connect_to_qdrant
+from app.db.qdrant import connect_to_qdrant, close_qdrant_connection  # Added
 from app.api.document import router as documents_router
 
 # Configure logging
@@ -20,12 +20,13 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("🚀 Starting Quiz App API...")
     await connect_to_mongo()
-    connect_to_qdrant()
+    connect_to_qdrant()  # Added this line
     logger.info("✓ All connections initialized")
     yield
     # Shutdown
     logger.info("🛑 Shutting down Quiz App API...")
     await close_mongo_connection()
+    close_qdrant_connection()  # Added this line
     logger.info("✓ Cleanup complete")
 
 app = FastAPI(
@@ -37,7 +38,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:4000"],
+    allow_origins=["http://localhost:4000" , "http://192.168.0.121:4000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
