@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     # Qdrant Configuration
     qdrant_host: str = "localhost"
     qdrant_port: int = 6333
-    qdrant_collection_name: str = "quiz_embeddings"
+    qdrant_collection_name: str = "materials_vectors" 
     qdrant_vector_size: int = 384
     
     # Additional Qdrant fields for materials system

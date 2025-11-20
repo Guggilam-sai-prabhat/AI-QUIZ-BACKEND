@@ -1,3 +1,7 @@
+"""
+Qdrant Database Connection Manager
+UPDATED VERSION - Replace your entire app/db/qdrant.py with this
+"""
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 from qdrant_client.http.exceptions import UnexpectedResponse
@@ -142,3 +146,73 @@ def close_qdrant_connection():
         qdrant_db.client.close()
         logger.info("👋 Qdrant connection closed")
         qdrant_db.is_connected = False
+
+
+# ==================== NEW FUNCTIONS FOR SEARCH API ====================
+
+def get_qdrant_service():
+    """
+    Get QdrantService instance with business logic
+    Lazy import to avoid circular dependencies
+    
+    Returns:
+        QdrantService: Service instance
+    """
+    from app.services.qdrant_service import QdrantService
+    
+    if not qdrant_db.client or not qdrant_db.is_connected:
+        logger.warning("⚠️ Qdrant not connected, attempting to connect...")
+        connect_to_qdrant()
+    
+    return QdrantService(
+        host=settings.qdrant_host,
+        port=settings.qdrant_port,
+        collection_name=settings.qdrant_collection_name,
+        vector_size=settings.qdrant_vector_size
+    )
+
+
+async def check_qdrant_health() -> dict:
+    """
+    Async health check for Qdrant
+    
+    Returns:
+        dict: Health status information
+    """
+    try:
+        if ping_qdrant():
+            info = get_collection_info()
+            
+            return {
+                "status": "healthy",
+                "connected": True,
+                "host": settings.qdrant_host,
+                "port": settings.qdrant_port,
+                "collection": info
+            }
+        else:
+            return {
+                "status": "unhealthy",
+                "connected": False,
+                "host": settings.qdrant_host,
+                "port": settings.qdrant_port,
+                "error": "Connection failed"
+            }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "connected": False,
+            "host": settings.qdrant_host,
+            "port": settings.qdrant_port,
+            "error": str(e)
+        }
+
+
+def is_qdrant_connected() -> bool:
+    """Check if Qdrant is currently connected"""
+    return qdrant_db.is_connected
+
+
+def get_collection_name() -> str:
+    """Get the configured collection name"""
+    return settings.qdrant_collection_name
