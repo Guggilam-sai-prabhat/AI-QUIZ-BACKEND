@@ -1,6 +1,6 @@
 """
 Quiz App API - Main Application
-Complete with search functionality
+Complete with search functionality and MCP server
 FILE: main.py
 """
 from fastapi import FastAPI, Request
@@ -13,7 +13,9 @@ import time
 from app.db.mongodb import connect_to_mongo, close_mongo_connection
 from app.db.qdrant import connect_to_qdrant, close_qdrant_connection, get_qdrant_service
 from app.api.document import router as documents_router
-from app.api.search import router as search_router  # ✅ ADD THIS
+from app.api.search import router as search_router
+from app.api.quiz import router as quiz_router
+from app.mcp_server.routes import router as mcp_router
 
 # Configure logging
 logging.basicConfig(
@@ -52,6 +54,14 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"⚠ Qdrant collection setup warning: {e}")
         
+        # Initialize MCP Server
+        try:
+            from app.mcp_server.server import get_mcp_server
+            mcp_server = get_mcp_server()
+            logger.info(f"✓ MCP Server initialized: {mcp_server.server_name} v{mcp_server.version}")
+        except Exception as e:
+            logger.warning(f"⚠ MCP Server initialization warning: {e}")
+        
         logger.info("✓ All connections initialized")
         
     except Exception as e:
@@ -79,19 +89,21 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Quiz App API",
     description="""
-    Quiz App API with document management and semantic search.
+    Quiz App API with document management, semantic search, and MCP server.
     
     ## Features
     - **Document Management**: Upload, retrieve, update, and delete documents
     - **Semantic Search**: Find relevant content using natural language queries
     - **Vector Embeddings**: Powered by SentenceTransformers and Qdrant
     - **MongoDB Storage**: Persistent document metadata and content
+    - **MCP Server**: Model Context Protocol for AI context provision
     
     ## Endpoints
     - **Documents**: `/api/documents/*` - CRUD operations for documents
     - **Search**: `/api/search-context` - Semantic search across documents
     - **Search Health**: `/api/search-health` - Check search service status
     - **Collection Info**: `/api/collection-info` - View collection statistics
+    - **MCP**: `/mcp/*` - Model Context Protocol endpoints
     - **Health**: `/health` - Overall service health check
     """,
     version="1.0.0",
@@ -106,8 +118,9 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:4000",
-        "http://192.168.0.121:4000",
+        "http://192.168.0.121:3001",
         "http://localhost:3000",  # Common React dev port
+        "http://localhost:3001"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -144,8 +157,14 @@ async def log_requests(request: Request, call_next):
 # Documents API
 app.include_router(documents_router, prefix="/api", tags=["Documents"])
 
-# Search API - ✅ ADD THIS LINE
+# Search API
 app.include_router(search_router, prefix="/api", tags=["Search"])
+
+# MCP Server API 
+app.include_router(mcp_router, tags=["MCP Server"])
+
+#Quiz API
+app.include_router(quiz_router , tags=["Quiz"])
 
 
 # ==================== ROOT ENDPOINTS ====================
@@ -164,6 +183,8 @@ async def root():
             "search": "/api/search-context",
             "search_health": "/api/search-health",
             "collection_info": "/api/collection-info",
+            "mcp_status": "/mcp/status",
+            "mcp_materials": "/mcp/materials",
             "health": "/health"
         }
     }
@@ -179,6 +200,7 @@ async def health_check():
     - MongoDB connection
     - Qdrant connection
     - Collection status
+    - MCP Server status
     
     Returns:
         Health status for all components
@@ -190,8 +212,6 @@ async def health_check():
     }
     
     overall_healthy = True
-    
-
     
     # Check Qdrant
     try:
@@ -225,6 +245,29 @@ async def health_check():
             "message": str(e)
         }
         logger.error(f"❌ Qdrant health check failed: {e}")
+    
+    # Check MCP Server
+    try:
+        from app.mcp_server.server import get_mcp_server
+        mcp_server = get_mcp_server()
+        mcp_info = await mcp_server.get_server_info()
+        
+        health_status["components"]["mcp_server"] = {
+            "status": "healthy",
+            "message": "MCP server operational",
+            "server_name": mcp_info.get("server_name"),
+            "version": mcp_info.get("version"),
+            "uptime_seconds": mcp_info.get("uptime_seconds")
+        }
+        logger.debug("✓ MCP Server health check passed")
+        
+    except Exception as e:
+        overall_healthy = False
+        health_status["components"]["mcp_server"] = {
+            "status": "unhealthy",
+            "message": str(e)
+        }
+        logger.error(f"❌ MCP Server health check failed: {e}")
     
     # Set overall status
     health_status["status"] = "healthy" if overall_healthy else "degraded"
