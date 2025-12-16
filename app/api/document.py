@@ -16,6 +16,9 @@ from app.services.text_chunker import chunk_text, get_chunk_stats
 from app.services.embedding_service import get_embeddings, get_embedding_dimension
 from app.services.qdrant_service import get_qdrant_service
 
+# Import difficulty rating service
+from app.services.difficulty_service import rate_chunk_difficulty, get_available_providers as get_difficulty_providers
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -33,6 +36,9 @@ CHUNK_SIZE = 500  # tokens
 CHUNK_OVERLAP = 50  # tokens
 EMBEDDING_MODEL = "sentence-transformers"  # or "openai"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"  # Default for sentence-transformers
+
+# Difficulty rating configuration
+DIFFICULTY_PROVIDER = os.getenv("DIFFICULTY_LLM_PROVIDER", "openai")  # or "anthropic", "grok"
 
 # Ensure upload directory exists
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -135,11 +141,13 @@ async def process_embeddings_pipeline(
     chunk_overlap: int = CHUNK_OVERLAP
 ) -> dict:
     """
-    Process the complete embeddings pipeline:
+    Process the complete embeddings pipeline with difficulty rating:
     1. Chunk text
-    2. Generate embeddings
-    3. Store in Qdrant
-    4. Update MongoDB with chunk_count
+    2. Rate difficulty for each chunk
+    3. Generate embeddings
+    4. Store in Qdrant with difficulty metadata
+    5. Store chunk details in MongoDB
+    6. Update MongoDB with chunk_count and difficulty distribution
     
     Args:
         document_id: MongoDB document ID
@@ -177,8 +185,34 @@ async def process_embeddings_pipeline(
             f"range: {stats['min_chunk_tokens']}-{stats['max_chunk_tokens']})"
         )
         
-        # Step 2: Generate embeddings
-        logger.info(f"🧠 Step 2: Generating embeddings ({EMBEDDING_MODEL})")
+        # Step 2: Rate difficulty for each chunk
+        logger.info(f"🎯 Step 2: Rating difficulty for {len(chunks)} chunks")
+        difficulties = []
+        difficulty_distribution = {"easy": 0, "medium": 0, "hard": 0}
+        
+        for idx, chunk in enumerate(chunks):
+            try:
+                difficulty = await rate_chunk_difficulty(chunk, provider=DIFFICULTY_PROVIDER)
+                difficulties.append(difficulty)
+                difficulty_distribution[difficulty] += 1
+                
+                if (idx + 1) % 10 == 0:
+                    logger.info(f"   Rated {idx + 1}/{len(chunks)} chunks...")
+                    
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to rate chunk {idx}, using 'medium': {e}")
+                difficulties.append("medium")
+                difficulty_distribution["medium"] += 1
+        
+        logger.info(
+            f"✅ Difficulty distribution: "
+            f"easy={difficulty_distribution['easy']}, "
+            f"medium={difficulty_distribution['medium']}, "
+            f"hard={difficulty_distribution['hard']}"
+        )
+        
+        # Step 3: Generate embeddings
+        logger.info(f"🧠 Step 3: Generating embeddings ({EMBEDDING_MODEL})")
         embeddings = get_embeddings(
             chunks=chunks,
             model=EMBEDDING_MODEL,
@@ -194,18 +228,19 @@ async def process_embeddings_pipeline(
         embedding_dim = len(embeddings[0]) if embeddings else 0
         logger.info(f"✅ Generated {len(embeddings)} embeddings (dim: {embedding_dim})")
         
-        # Step 3: Store in Qdrant
-        logger.info(f"💾 Step 3: Storing vectors in Qdrant")
+        # Step 4: Store in Qdrant with difficulty metadata
+        logger.info(f"💾 Step 4: Storing vectors in Qdrant with difficulty ratings")
         vector_service = get_qdrant_service()
         
         # Ensure collection exists with correct dimension
         vector_service.ensure_collection(vector_size=embedding_dim)
         
-        # Upsert embeddings
+        # Upsert embeddings with difficulty ratings
         upsert_result = await vector_service.upsert_embeddings(
             material_id=document_id,
             chunks=chunks,
-            embeddings=embeddings
+            embeddings=embeddings,
+            difficulties=difficulties
         )
         
         if upsert_result["status"] != "success":
@@ -215,10 +250,24 @@ async def process_embeddings_pipeline(
             f"✅ Stored {upsert_result['chunks_upserted']} vectors in Qdrant"
         )
         
-        # Step 4: Update MongoDB with chunk_count
-        logger.info(f"📊 Step 4: Updating MongoDB document")
+        # Step 5: Store chunk details in MongoDB (optional - in 'chunks' subcollection)
+        logger.info(f"📊 Step 5: Storing chunk metadata in MongoDB")
         collection = get_collection("documents")
         from bson import ObjectId
+        
+        # Prepare chunk metadata for storage
+        chunk_metadata = []
+        for idx, (chunk, difficulty) in enumerate(zip(chunks, difficulties)):
+            chunk_metadata.append({
+                "chunk_id": idx,
+                "text": chunk,
+                "text_length": len(chunk),
+                "difficulty": difficulty,
+                "indexed_at": datetime.now(timezone.utc)
+            })
+        
+        # Step 6: Update MongoDB with comprehensive metadata
+        logger.info(f"📊 Step 6: Updating MongoDB document with statistics")
         
         update_result = await collection.update_one(
             {"_id": ObjectId(document_id)},
@@ -228,6 +277,9 @@ async def process_embeddings_pipeline(
                     "embedding_model": EMBEDDING_MODEL,
                     "embedding_model_name": EMBEDDING_MODEL_NAME,
                     "embedding_dimension": embedding_dim,
+                    "difficulty_distribution": difficulty_distribution,
+                    "difficulty_provider": DIFFICULTY_PROVIDER,
+                    "chunks": chunk_metadata,  # Store chunk details
                     "indexed_at": datetime.now(timezone.utc)
                 }
             }
@@ -236,7 +288,10 @@ async def process_embeddings_pipeline(
         if update_result.modified_count == 0:
             logger.warning(f"⚠️ MongoDB document not updated for {document_id}")
         else:
-            logger.info(f"✅ MongoDB document updated with chunk_count={len(chunks)}")
+            logger.info(
+                f"✅ MongoDB document updated with chunk_count={len(chunks)}, "
+                f"difficulty distribution"
+            )
         
         # Return success result
         return {
@@ -244,10 +299,14 @@ async def process_embeddings_pipeline(
             "chunk_count": len(chunks),
             "embedding_dimension": embedding_dim,
             "status": "embedded",
+            "difficulty_distribution": difficulty_distribution,
             "stats": {
                 "total_chunks": len(chunks),
                 "avg_chunk_tokens": stats['avg_chunk_tokens'],
-                "total_tokens": stats['total_chunk_tokens']
+                "total_tokens": stats['total_chunk_tokens'],
+                "easy_chunks": difficulty_distribution["easy"],
+                "medium_chunks": difficulty_distribution["medium"],
+                "hard_chunks": difficulty_distribution["hard"]
             }
         }
         
@@ -325,6 +384,24 @@ async def health_check():
         health_status["status"] = "degraded"
         logger.error(f"Upload directory check failed: {str(e)}")
     
+    # Check difficulty rating LLM providers
+    try:
+        from app.services.difficulty_service import get_available_providers
+        available_providers = get_available_providers()
+        health_status["checks"]["difficulty_llm"] = {
+            "configured": bool(available_providers),
+            "providers": available_providers,
+            "selected_provider": DIFFICULTY_PROVIDER
+        }
+        # Also check environment variables directly
+        health_status["checks"]["env_vars"] = {
+            "OPENAI_API_KEY": "set" if os.getenv("OPENAI_API_KEY") else "not set",
+            "ANTHROPIC_API_KEY": "set" if os.getenv("ANTHROPIC_API_KEY") else "not set",
+            "GROK_API_KEY": "set" if os.getenv("GROK_API_KEY") else "not set",
+        }
+    except Exception as e:
+        health_status["checks"]["difficulty_llm"] = f"error: {str(e)}"
+    
     return health_status
 
 
@@ -334,9 +411,10 @@ async def upload_document(file: UploadFile = File(...)):
     Upload a PDF document with complete vector embedding pipeline:
     1. Extract text from PDF
     2. Chunk text into manageable pieces
-    3. Generate embeddings for each chunk
-    4. Store vectors in Qdrant
-    5. Update MongoDB with chunk count
+    3. Rate difficulty for each chunk
+    4. Generate embeddings for each chunk
+    5. Store vectors in Qdrant with difficulty metadata
+    6. Update MongoDB with chunk count and difficulty distribution
     """
     file_path = None
     document_id = None
@@ -391,6 +469,15 @@ async def upload_document(file: UploadFile = File(...)):
             os.remove(file_path)
             logger.info(f"🗑️  Removed duplicate file: {file_path}")
             
+            # Determine status based on available fields
+            embedding_status = existing_doc.get("embedding_status")
+            if embedding_status:
+                status = embedding_status
+            elif existing_doc.get("chunk_count", 0) > 0:
+                status = "embedded"
+            else:
+                status = "unknown"
+            
             # Return the existing document with embedding info
             return EmbeddingResponse(
                 id=str(existing_doc["_id"]),
@@ -401,7 +488,8 @@ async def upload_document(file: UploadFile = File(...)):
                 uploaded_at=existing_doc["uploaded_at"],
                 material_id=str(existing_doc["_id"]),
                 chunk_count=existing_doc.get("chunk_count", 0),
-                status=existing_doc.get("embedding_status", "unknown")
+                status=status,
+                difficulty_distribution=existing_doc.get("difficulty_distribution")
             )
         
         logger.info(f"✅ No duplicate found. Proceeding with new upload.")
@@ -448,7 +536,7 @@ async def upload_document(file: UploadFile = File(...)):
         document_id = str(result.inserted_id)
         logger.info(f"✅ New document inserted with ID: {document_id}")
         
-        # Process embedding pipeline
+        # Process embedding pipeline with difficulty rating
         logger.info(f"🚀 Starting embedding pipeline for document {document_id}")
         embedding_result = await process_embeddings_pipeline(
             document_id=document_id,
@@ -468,6 +556,7 @@ async def upload_document(file: UploadFile = File(...)):
             material_id=embedding_result["material_id"],
             chunk_count=embedding_result["chunk_count"],
             status=embedding_result["status"],
+            difficulty_distribution=embedding_result.get("difficulty_distribution"),
             embedding_stats=embedding_result.get("stats")
         )
         
@@ -502,7 +591,7 @@ async def upload_document(file: UploadFile = File(...)):
 
 @router.get("/debug/document/{document_id}")
 async def debug_document(document_id: str):
-    """Debug endpoint to see raw document data including embedding info"""
+    """Debug endpoint to see raw document data including embedding and difficulty info"""
     from bson import ObjectId
     
     try:
@@ -520,6 +609,12 @@ async def debug_document(document_id: str):
             doc["extracted_text_length"] = len(doc["extracted_text"])
             doc["extracted_text_preview"] = doc["extracted_text"][:500] + "..."
             del doc["extracted_text"]
+        
+        # Show chunk preview instead of full chunks
+        if "chunks" in doc and len(doc["chunks"]) > 5:
+            doc["chunks_preview"] = doc["chunks"][:5]
+            doc["chunks_total"] = len(doc["chunks"])
+            del doc["chunks"]
         
         return doc
     except Exception as e:
@@ -556,7 +651,8 @@ async def get_materials(
                     file_size=doc["file_size"],
                     content_type=doc["content_type"],
                     file_hash=doc.get("file_hash", "unknown"),
-                    uploaded_at=doc["uploaded_at"]
+                    uploaded_at=doc["uploaded_at"],
+                    difficulty_distribution=doc.get("difficulty_distribution")
                 )
             )
         
@@ -580,7 +676,7 @@ async def get_material(document_id: str):
         document_id: MongoDB ObjectId of the document
     
     Returns:
-        Document metadata with extracted text
+        Document metadata with extracted text and difficulty info
     """
     try:
         from bson import ObjectId
@@ -599,7 +695,8 @@ async def get_material(document_id: str):
             file_hash=doc.get("file_hash", "unknown"),
             extracted_text=doc.get("extracted_text"),
             page_count=doc.get("page_count"),
-            uploaded_at=doc["uploaded_at"]
+            uploaded_at=doc["uploaded_at"],
+            difficulty_distribution=doc.get("difficulty_distribution")
         )
         
     except HTTPException:
@@ -716,4 +813,41 @@ async def get_vector_stats():
         raise HTTPException(
             status_code=500,
             detail="Failed to retrieve vector statistics"
+        )
+
+
+@router.get("/materials/{document_id}/chunks")
+async def get_material_chunks(
+    document_id: str,
+    difficulty: Optional[str] = Query(None, regex="^(easy|medium|hard)$")
+):
+    """
+    Get all chunks for a specific material with optional difficulty filter
+    
+    Args:
+        document_id: MongoDB ObjectId of the document
+        difficulty: Optional filter by difficulty level
+    
+    Returns:
+        List of chunks with difficulty ratings
+    """
+    try:
+        vector_service = get_qdrant_service()
+        chunks = await vector_service.get_material_chunks(
+            material_id=document_id,
+            difficulty=difficulty
+        )
+        
+        return {
+            "material_id": document_id,
+            "chunk_count": len(chunks),
+            "difficulty_filter": difficulty,
+            "chunks": chunks
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get chunks for {document_id}: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to retrieve chunks"
         )

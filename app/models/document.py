@@ -3,7 +3,7 @@ Pydantic models for document management
 FILE: app/models/document.py
 """
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 from bson import ObjectId
 
@@ -24,6 +24,22 @@ class PyObjectId(ObjectId):
     @classmethod
     def __get_pydantic_json_schema__(cls, core_schema, handler):
         return {"type": "string"}
+
+
+class ChunkMetadata(BaseModel):
+    """
+    Metadata for individual text chunks
+    """
+    chunk_id: int
+    text: str
+    text_length: int
+    difficulty: str  # "easy", "medium", "hard"
+    indexed_at: datetime
+    
+    class Config:
+        json_encoders = {
+            datetime: lambda v: v.isoformat()
+        }
 
 
 class DocumentMetadata(BaseModel):
@@ -53,6 +69,11 @@ class DocumentMetadata(BaseModel):
     indexed_at: Optional[datetime] = None
     embedding_attempted_at: Optional[datetime] = None
     
+    # Difficulty rating metadata
+    difficulty_distribution: Optional[Dict[str, int]] = None  # {"easy": 5, "medium": 8, "hard": 3}
+    difficulty_provider: Optional[str] = None  # "openai", "anthropic", "grok", "rule-based"
+    chunks: Optional[List[Dict[str, Any]]] = None  # Array of chunk metadata
+    
     uploaded_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     
     class Config:
@@ -80,6 +101,9 @@ class DocumentResponse(BaseModel):
     # Optional embedding metadata
     chunk_count: Optional[int] = None
     embedding_status: Optional[str] = None
+    
+    # Difficulty metadata
+    difficulty_distribution: Optional[Dict[str, int]] = None
     
     class Config:
         json_encoders = {
@@ -112,6 +136,10 @@ class DocumentDetailResponse(BaseModel):
     embedding_status: Optional[str] = None
     indexed_at: Optional[datetime] = None
     
+    # Difficulty metadata
+    difficulty_distribution: Optional[Dict[str, int]] = None
+    difficulty_provider: Optional[str] = None
+    
     class Config:
         json_encoders = {
             datetime: lambda v: v.isoformat()
@@ -140,6 +168,9 @@ class EmbeddingResponse(BaseModel):
     embedding_stats: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
     
+    # Difficulty rating results
+    difficulty_distribution: Optional[Dict[str, int]] = None
+    
     class Config:
         json_encoders = {
             datetime: lambda v: v.isoformat()
@@ -162,6 +193,11 @@ class SearchQuery(BaseModel):
         default=None, 
         description="Optional: limit search to specific material"
     )
+    difficulty: Optional[str] = Field(
+        default=None,
+        description="Optional: filter by difficulty level (easy, medium, hard)",
+        pattern="^(easy|medium|hard)$"
+    )
     score_threshold: Optional[float] = Field(
         default=None, 
         ge=0.0, 
@@ -180,6 +216,7 @@ class SearchResult(BaseModel):
     material_id: str
     chunk_id: int
     text: str
+    difficulty: str  # "easy", "medium", "hard"
     metadata: Dict[str, Any]
 
 
@@ -195,6 +232,36 @@ class SearchResponse(BaseModel):
     filters_applied: Optional[Dict[str, Any]] = None
 
 
+class ChunkResponse(BaseModel):
+    """
+    Response model for individual chunk data
+    """
+    
+    id: str
+    chunk_id: int
+    text: str
+    difficulty: str
+    text_length: int
+    material_id: str
+    metadata: Dict[str, Any]
+    
+    class Config:
+        json_encoders = {
+            datetime: lambda v: v.isoformat()
+        }
+
+
+class ChunksListResponse(BaseModel):
+    """
+    Response model for listing chunks from a material
+    """
+    
+    material_id: str
+    chunk_count: int
+    difficulty_filter: Optional[str] = None
+    chunks: List[Dict[str, Any]]
+
+
 class ReindexRequest(BaseModel):
     """
     Request to reindex a document's embeddings
@@ -205,6 +272,10 @@ class ReindexRequest(BaseModel):
     force: bool = Field(
         default=False, 
         description="Force reindex even if already indexed"
+    )
+    recompute_difficulty: bool = Field(
+        default=False,
+        description="Recompute difficulty ratings during reindex"
     )
 
 
@@ -218,6 +289,7 @@ class ReindexResponse(BaseModel):
     chunk_count: int
     message: str
     previous_chunk_count: Optional[int] = None
+    difficulty_distribution: Optional[Dict[str, int]] = None
 
 
 class BatchDeleteRequest(BaseModel):
@@ -266,6 +338,7 @@ class CollectionStatsResponse(BaseModel):
     total_chunks: int
     avg_chunks_per_document: float
     embedding_status_breakdown: Dict[str, int]
+    difficulty_breakdown: Optional[Dict[str, int]] = None  # Total across all documents
     oldest_document: Optional[datetime] = None
     newest_document: Optional[datetime] = None
     
@@ -287,3 +360,4 @@ class VectorStatsResponse(BaseModel):
     status: str
     vector_size: int
     distance_metric: str
+    difficulty_indexed: bool = True  # Indicates if difficulty field is indexed

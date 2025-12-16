@@ -320,10 +320,13 @@ def get_available_providers() -> list:
     available = []
     
     if os.getenv("OPENAI_API_KEY"):
+        logger.info(f"✅ OpenAI API key found, will use for difficulty rating")
         available.append("openai")
     # if os.getenv("ANTHROPIC_API_KEY"):
     #     available.append("anthropic")
     # if os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY"):
     #     available.append("grok")
+    else:
+         logger.warning("⚠️ No OpenAI API key found, will use rule-based difficulty rating")
     
     return available

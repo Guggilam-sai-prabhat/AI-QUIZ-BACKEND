@@ -24,7 +24,7 @@ async def handle_mcp_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
     method = request_data.get("method")
     params = request_data.get("params", {})
     
-    logger.info(f"🔄 MCP Request: {method}")
+    logger.info(f"MCP Request: {method}")
     
     # Route to appropriate handler
     if method == "get_server_info":

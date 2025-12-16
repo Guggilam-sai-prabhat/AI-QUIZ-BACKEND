@@ -1,21 +1,20 @@
 """
 Business logic for Qdrant operations
 Orchestrates CRUD operations with validation, logging, and complex workflows
+UPDATED: Added fallback mechanisms for missing chunks
 """
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 import logging
 import os
 import uuid
+import random
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
     VectorParams,
     PointStruct,
-    Filter,
-    FieldCondition,
-    MatchValue
 )
 from qdrant_client.http import models
 
@@ -147,7 +146,14 @@ class QdrantService:
                 field_schema=models.PayloadSchemaType.INTEGER
             )
             
-            logger.info("✓ Created payload indexes for material_id and chunk_id")
+            # Index difficulty for filtering by difficulty level
+            self.client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name="difficulty",
+                field_schema=models.PayloadSchemaType.KEYWORD
+            )
+            
+            logger.info("✓ Created payload indexes for material_id, chunk_id, and difficulty")
             
         except Exception as e:
             # Indexes might already exist, log but don't fail
@@ -159,7 +165,8 @@ class QdrantService:
         self,
         material_id: str,
         chunks: List[str],
-        embeddings: List[List[float]]
+        embeddings: List[List[float]],
+        difficulties: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
         Insert or update chunk embeddings for a material (document)
@@ -169,6 +176,7 @@ class QdrantService:
             material_id: Unique identifier for the material/document
             chunks: List of text chunks
             embeddings: List of embedding vectors (must match chunks length)
+            difficulties: Optional list of difficulty ratings ("easy", "medium", "hard")
         
         Returns:
             Dictionary with operation statistics
@@ -181,6 +189,12 @@ class QdrantService:
             raise ValueError(
                 f"Chunks and embeddings length mismatch: "
                 f"{len(chunks)} chunks vs {len(embeddings)} embeddings"
+            )
+        
+        if difficulties and len(difficulties) != len(chunks):
+            raise ValueError(
+                f"Difficulties length mismatch: "
+                f"{len(difficulties)} difficulties vs {len(chunks)} chunks"
             )
         
         if not chunks:
@@ -213,6 +227,10 @@ class QdrantService:
                     "chunk_total": len(chunks)
                 }
                 
+                # Add difficulty rating if provided
+                if difficulties:
+                    payload["difficulty"] = difficulties[chunk_id]
+                
                 # Create point
                 point = PointStruct(
                     id=point_id,
@@ -236,11 +254,19 @@ class QdrantService:
                 f"✓ Upserted {len(points)} embeddings for material '{material_id}'"
             )
             
+            # Calculate difficulty distribution if provided
+            difficulty_stats = {}
+            if difficulties:
+                for diff in ["easy", "medium", "hard"]:
+                    count = difficulties.count(diff)
+                    difficulty_stats[diff] = count
+            
             return {
                 "material_id": material_id,
                 "chunks_upserted": len(points),
                 "status": "success",
-                "indexed_at": timestamp
+                "indexed_at": timestamp,
+                "difficulty_stats": difficulty_stats if difficulty_stats else None
             }
             
         except Exception as e:
@@ -295,6 +321,7 @@ class QdrantService:
         query_embedding: List[float],
         limit: int = 10,
         material_id: Optional[str] = None,
+        difficulty: Optional[str] = None,
         score_threshold: Optional[float] = None
     ) -> List[Dict[str, Any]]:
         """
@@ -305,23 +332,35 @@ class QdrantService:
             query_embedding: Query vector
             limit: Maximum number of results
             material_id: Optional filter to search within specific material
+            difficulty: Optional filter by difficulty level ("easy", "medium", "hard")
             score_threshold: Minimum similarity score (0-1)
         
         Returns:
             List of search results with scores and metadata
         """
         try:
-            # Business rule: Build filter if material_id specified
-            query_filter = None
+            # Business rule: Build filter conditions
+            filter_conditions = []
+            
             if material_id:
-                query_filter = models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="material_id",
-                            match=models.MatchValue(value=material_id)
-                        )
-                    ]
+                filter_conditions.append(
+                    models.FieldCondition(
+                        key="material_id",
+                        match=models.MatchValue(value=material_id)
+                    )
                 )
+            
+            if difficulty:
+                filter_conditions.append(
+                    models.FieldCondition(
+                        key="difficulty",
+                        match=models.MatchValue(value=difficulty)
+                    )
+                )
+            
+            query_filter = None
+            if filter_conditions:
+                query_filter = models.Filter(must=filter_conditions)
             
             # Business rule: Cap limit at reasonable max
             limit = min(limit, 100)
@@ -347,12 +386,14 @@ class QdrantService:
                     "material_id": result["payload"].get("material_id"),
                     "chunk_id": result["payload"].get("chunk_id"),
                     "text": result["payload"].get("text"),
+                    "difficulty": result["payload"].get("difficulty", "unknown"),
                     "metadata": result["payload"]
                 })
             
             logger.info(
                 f"✓ Found {len(results)} similar chunks "
-                f"(material_filter: {material_id or 'none'})"
+                f"(material_filter: {material_id or 'none'}, "
+                f"difficulty_filter: {difficulty or 'none'})"
             )
             
             return results
@@ -364,7 +405,8 @@ class QdrantService:
     async def get_material_chunks(
         self,
         material_id: str,
-        with_vectors: bool = False
+        with_vectors: bool = False,
+        difficulty: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
         Retrieve all chunks for a specific material
@@ -373,20 +415,29 @@ class QdrantService:
         Args:
             material_id: Material identifier
             with_vectors: Include embedding vectors in response
+            difficulty: Optional filter by difficulty level
         
         Returns:
             List of chunks with metadata, ordered by chunk_id
         """
         try:
             # Business rule: Build filter for material
-            filter_condition = models.Filter(
-                must=[
+            filter_conditions = [
+                models.FieldCondition(
+                    key="material_id",
+                    match=models.MatchValue(value=material_id)
+                )
+            ]
+            
+            if difficulty:
+                filter_conditions.append(
                     models.FieldCondition(
-                        key="material_id",
-                        match=models.MatchValue(value=material_id)
+                        key="difficulty",
+                        match=models.MatchValue(value=difficulty)
                     )
-                ]
-            )
+                )
+            
+            filter_condition = models.Filter(must=filter_conditions)
             
             # Use CRUD layer for scrolling
             records, _ = qdrant.scroll_points(
@@ -404,6 +455,7 @@ class QdrantService:
                     "id": record["id"],
                     "chunk_id": record["payload"].get("chunk_id"),
                     "text": record["payload"].get("text"),
+                    "difficulty": record["payload"].get("difficulty", "unknown"),
                     "metadata": record["payload"]
                 }
                 
@@ -421,6 +473,145 @@ class QdrantService:
         except Exception as e:
             logger.error(f"Error retrieving material chunks: {e}")
             return []
+    
+    async def get_chunk_by_difficulty(
+        self,
+        material_id: str,
+        difficulty: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get a random chunk filtered by material and difficulty
+        Business logic: filters by both material_id and difficulty, returns random selection
+        
+        Args:
+            material_id: Material identifier
+            difficulty: Difficulty level ("easy", "medium", "hard")
+        
+        Returns:
+            Dictionary with chunk text and payload, or None if no matching chunks found
+        """
+        try:
+            # Business rule: Validate difficulty level
+            valid_difficulties = ["easy", "medium", "hard"]
+            if difficulty not in valid_difficulties:
+                logger.warning(
+                    f"Invalid difficulty '{difficulty}'. Must be one of: {valid_difficulties}"
+                )
+                return None
+            
+            # Business rule: Build filter for material_id and difficulty
+            filter_condition = models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="material_id",
+                        match=models.MatchValue(value=material_id)
+                    ),
+                    models.FieldCondition(
+                        key="difficulty",
+                        match=models.MatchValue(value=difficulty)
+                    )
+                ]
+            )
+            
+            # Use CRUD layer to retrieve matching chunks
+            records, _ = qdrant.scroll_points(
+                client=self.client,
+                collection_name=self.collection_name,
+                limit=1000,  # Get all matching chunks
+                with_vectors=False,
+                filter_condition=filter_condition
+            )
+            
+            if not records:
+                logger.info(
+                    f"No chunks found for material '{material_id}' "
+                    f"with difficulty '{difficulty}'"
+                )
+                return None
+            
+            # Business rule: Select random chunk from matching results
+            selected_record = random.choice(records)
+            
+            # Format result
+            result = {
+                "id": selected_record["id"],
+                "text": selected_record["payload"].get("text"),
+                "payload": selected_record["payload"]
+            }
+            
+            logger.info(
+                f"✓ Selected random chunk (id: {result['id']}) from "
+                f"{len(records)} matching chunks for material '{material_id}' "
+                f"with difficulty '{difficulty}'"
+            )
+            
+            return result
+            
+        except Exception as e:
+            logger.error(
+                f"Error retrieving chunk by difficulty for material {material_id}: {e}"
+            )
+            return None
+    
+    async def get_any_chunk_for_material(
+        self,
+        material_id: str,
+        limit: int = 1
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve any chunk for a material without difficulty filtering.
+        Used as last resort fallback when no chunks match specific difficulty.
+        
+        Args:
+            material_id: Material ID to retrieve chunks for
+            limit: Number of chunks to retrieve (default: 1)
+        
+        Returns:
+            Dictionary with chunk data or None if no chunks exist
+        """
+        try:
+            # Build filter for only material_id
+            filter_condition = models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="material_id",
+                        match=models.MatchValue(value=material_id)
+                    )
+                ]
+            )
+            
+            # Scroll through points with only material_id filter
+            records, _ = qdrant.scroll_points(
+                client=self.client,
+                collection_name=self.collection_name,
+                limit=limit,
+                with_vectors=False,
+                filter_condition=filter_condition
+            )
+            
+            if not records:
+                logger.warning(f"No chunks found for material '{material_id}' at all")
+                return None
+            
+            # Pick a random chunk if multiple available
+            selected_record = random.choice(records) if len(records) > 1 else records[0]
+            
+            result = {
+                "id": selected_record["id"],
+                "text": selected_record["payload"].get("text"),
+                "payload": selected_record["payload"]
+            }
+            
+            logger.info(
+                f"✓ Retrieved any chunk (id: {result['id']}) from "
+                f"{len(records)} total chunks for material '{material_id}'"
+            )
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error retrieving any chunk for material {material_id}: {e}")
+            return None
     
     # ==================== UTILITY METHODS ====================
     

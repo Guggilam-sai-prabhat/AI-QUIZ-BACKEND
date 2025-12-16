@@ -1,8 +1,8 @@
 """
 Quiz API Routes
-FastAPI endpoints for quiz generation and management
+FastAPI endpoints for quiz generation, submission, and management
 """
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Path
 from pydantic import BaseModel, Field
 from typing import Optional, List
 import logging
@@ -11,7 +11,14 @@ from app.services.quiz_service import (
     get_quiz_service,
     QuizGenerationError,
     MaterialNotFoundError,
-    ChunkRetrievalError
+    ChunkRetrievalError,
+    QuizNotFoundError,
+    QuizValidationError
+)
+from app.models.quiz import (
+    QuizSubmission,
+    QuizAttemptResponse,
+    QuizAttemptSummary
 )
 
 logger = logging.getLogger(__name__)
@@ -19,7 +26,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/quiz", tags=["Quiz"])
 
 
-# Request/Response Models
+# ==================== GENERATION REQUEST/RESPONSE MODELS ====================
 
 class GenerateQuizRequest(BaseModel):
     """Request model for quiz generation"""
@@ -93,7 +100,7 @@ class QuizListItem(BaseModel):
     created_at: str
 
 
-# Endpoints
+# ==================== QUIZ GENERATION ENDPOINTS ====================
 
 @router.post(
     "/generate",
@@ -145,6 +152,59 @@ async def generate_quiz(request: GenerateQuizRequest):
         raise HTTPException(
             status_code=500,
             detail=f"Failed to generate quiz: {str(e)}"
+        )
+
+
+@router.get(
+    "/all",
+    response_model=List[QuizListItem],
+    summary="Get All Quizzes",
+    description="Retrieve all quizzes across all materials with pagination"
+)
+async def get_all_quizzes(
+    skip: int = Query(0, ge=0, description="Number of records to skip"),
+    limit: int = Query(50, ge=1, le=100, description="Maximum number of quizzes to return")
+):
+    """
+    Get all quizzes in the system
+    
+    Args:
+        skip: Number of records to skip (for pagination)
+        limit: Maximum number of quizzes to return
+    
+    Returns:
+        List of all quizzes sorted by creation date (newest first)
+        
+    Example response:
+        [
+            {
+                "quiz_id": "550e8400-e29b-41d4-a716-446655440000",
+                "material_id": "507f1f77bcf86cd799439011",
+                "question_count": 5,
+                "created_at": "2025-12-08T10:30:00Z"
+            },
+            ...
+        ]
+    """
+    try:
+        quiz_service = get_quiz_service()
+        quizzes = await quiz_service.get_all_quizzes(skip, limit)
+        
+        return [
+            QuizListItem(
+                quiz_id=q["quiz_id"],
+                material_id=q["material_id"],
+                question_count=q["question_count"],
+                created_at=q["created_at"].isoformat()
+            )
+            for q in quizzes
+        ]
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to get all quizzes: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to retrieve quizzes: {str(e)}"
         )
 
 
@@ -235,6 +295,59 @@ async def get_quizzes_by_material(
         )
 
 
+@router.get(
+    "/all",
+    response_model=List[QuizListItem],
+    summary="Get All Quizzes",
+    description="Retrieve all quizzes across all materials with pagination"
+)
+async def get_all_quizzes(
+    skip: int = Query(0, ge=0, description="Number of records to skip"),
+    limit: int = Query(50, ge=1, le=100, description="Maximum number of quizzes to return")
+):
+    """
+    Get all quizzes in the system
+    
+    Args:
+        skip: Number of records to skip (for pagination)
+        limit: Maximum number of quizzes to return
+    
+    Returns:
+        List of all quizzes sorted by creation date (newest first)
+        
+    Example response:
+        [
+            {
+                "quiz_id": "550e8400-e29b-41d4-a716-446655440000",
+                "material_id": "507f1f77bcf86cd799439011",
+                "question_count": 5,
+                "created_at": "2025-12-08T10:30:00Z"
+            },
+            ...
+        ]
+    """
+    try:
+        quiz_service = get_quiz_service()
+        quizzes = await quiz_service.get_all_quizzes(skip, limit)
+        
+        return [
+            QuizListItem(
+                quiz_id=q["quiz_id"],
+                material_id=q["material_id"],
+                question_count=q["question_count"],
+                created_at=q["created_at"].isoformat()
+            )
+            for q in quizzes
+        ]
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to get all quizzes: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to retrieve quizzes: {str(e)}"
+        )
+
+
 @router.delete(
     "/{quiz_id}",
     summary="Delete Quiz",
@@ -275,16 +388,272 @@ async def delete_quiz(quiz_id: str):
         )
 
 
+# ==================== QUIZ SUBMISSION ENDPOINTS ====================
+
 @router.post(
-    "/generate-quiz",
-    response_model=GenerateQuizResponse,
-    summary="Generate Quiz (Alternative)",
-    description="Alternative endpoint matching the original spec",
-    deprecated=True
+    "/submit-quiz",
+    response_model=QuizAttemptResponse,
+    summary="Submit Quiz Answers",
+    description="""
+    Submit answers for a quiz and receive immediate grading results.
+    
+    ## Workflow:
+    1. Validates quiz exists in the system
+    2. Compares user answers with correct answers
+    3. Calculates score and percentage
+    4. Saves attempt to MongoDB
+    5. Returns detailed results
+    
+    ## Response includes:
+    - Score (number correct)
+    - Total questions
+    - Percentage
+    - Your answers vs correct answers
+    - Submission timestamp
+    """
 )
-async def generate_quiz_alt(request: GenerateQuizRequest):
+async def submit_quiz(submission: QuizSubmission):
     """
-    Alternative endpoint for backward compatibility
-    Redirects to /quiz/generate
+    Submit quiz answers for grading
+    
+    Args:
+        submission: Quiz submission with quiz_id and answers
+    
+    Returns:
+        QuizAttemptResponse with grading results
     """
-    return await generate_quiz(request)
+    try:
+        logger.info(
+            f"📝 Quiz submission received: quiz_id={submission.quiz_id}, "
+            f"answers_count={len(submission.answers)}"
+        )
+        
+        quiz_service = get_quiz_service()
+        result = await quiz_service.submit_quiz_attempt(
+            quiz_id=submission.quiz_id,
+            user_answers=submission.answers
+        )
+        
+        logger.info(
+            f"✅ Quiz graded: attempt_id={result['id']}, "
+            f"score={result['score']}/{result['total']} ({result['percentage']}%)"
+        )
+        
+        return QuizAttemptResponse(
+            _id=result["id"],
+            quiz_id=result["quiz_id"],
+            user_answers=result["user_answers"],
+            correct_answers=result["correct_answers"],
+            score=result["score"],
+            total=result["total"],
+            percentage=result["percentage"],
+            submitted_at=result["submitted_at"]
+        )
+        
+    except QuizNotFoundError as e:
+        logger.warning(f"⚠️ Quiz not found: {submission.quiz_id}")
+        raise HTTPException(status_code=404, detail=str(e))
+    
+    except QuizValidationError as e:
+        logger.warning(f"⚠️ Validation error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    
+    except Exception as e:
+        logger.error(f"❌ Quiz submission failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to process quiz submission. Please try again."
+        )
+
+
+@router.get(
+    "/attempts/{attempt_id}",
+    response_model=QuizAttemptResponse,
+    summary="Get Quiz Attempt Details",
+    description="Retrieve detailed information about a specific quiz attempt"
+)
+async def get_quiz_attempt(attempt_id: str):
+    """Get details of a specific quiz attempt"""
+    try:
+        quiz_service = get_quiz_service()
+        result = await quiz_service.get_attempt_by_id(attempt_id)
+        
+        if not result:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Quiz attempt '{attempt_id}' not found"
+            )
+        
+        return QuizAttemptResponse(
+            _id=result["_id"],
+            quiz_id=result["quiz_id"],
+            user_answers=result["user_answers"],
+            correct_answers=result["correct_answers"],
+            score=result["score"],
+            total=result["total"],
+            percentage=result["percentage"],
+            submitted_at=result["submitted_at"]
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Failed to get quiz attempt: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to retrieve quiz attempt"
+        )
+
+
+@router.get(
+    "/{quiz_id}/attempts",
+    response_model=List[QuizAttemptSummary],
+    summary="Get All Attempts for a Quiz",
+    description="Retrieve all submission attempts for a specific quiz"
+)
+async def get_quiz_attempts(
+    quiz_id: str,
+    skip: int = Query(0, ge=0, description="Number of records to skip"),
+    limit: int = Query(50, ge=1, le=100, description="Maximum records to return")
+):
+    """Get all attempts for a specific quiz"""
+    try:
+        quiz_service = get_quiz_service()
+        attempts = await quiz_service.get_attempts_for_quiz(quiz_id, skip, limit)
+        
+        return [
+            QuizAttemptSummary(
+                _id=attempt["_id"],
+                quiz_id=attempt["quiz_id"],
+                score=attempt["score"],
+                total=attempt["total"],
+                percentage=attempt["percentage"],
+                submitted_at=attempt["submitted_at"]
+            )
+            for attempt in attempts
+        ]
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to get quiz attempts: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to retrieve quiz attempts"
+        )
+
+
+@router.get(
+    "/{quiz_id}/statistics",
+    summary="Get Quiz Statistics",
+    description="Get aggregated statistics for a quiz"
+)
+async def get_quiz_statistics(quiz_id: str):
+    """Get statistical summary for a quiz"""
+    try:
+        quiz_service = get_quiz_service()
+        stats = await quiz_service.get_quiz_stats(quiz_id)
+        
+        return {
+            "quiz_id": quiz_id,
+            "statistics": stats,
+            "message": "Statistics retrieved successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to get quiz statistics: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to retrieve quiz statistics"
+        )
+
+
+# ==================== ATTEMPTS LISTING ENDPOINTS ====================
+
+@router.get(
+    "/attempts/{quiz_id}",
+    summary="Get All Attempts for a Quiz",
+    description="Retrieve full list of all submission attempts for a specific quiz"
+)
+async def get_all_attempts(quiz_id: str):
+    """
+    Get all attempts for a specific quiz
+    
+    Args:
+        quiz_id: Quiz identifier (UUID)
+    
+    Returns:
+        List of attempts with score, total, and submission timestamp
+        
+    Example response:
+        [
+            {"score": 3, "total": 5, "submitted_at": "2025-12-08T10:30:00Z"},
+            {"score": 4, "total": 5, "submitted_at": "2025-12-07T15:20:00Z"}
+        ]
+    """
+    try:
+        quiz_service = get_quiz_service()
+        attempts = await quiz_service.get_all_attempts_for_quiz(quiz_id)
+        
+        # Format response
+        return [
+            {
+                "score": attempt["score"],
+                "total": attempt["total"],
+                "submitted_at": attempt["submitted_at"].isoformat()
+            }
+            for attempt in attempts
+        ]
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to get attempts for quiz {quiz_id}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to retrieve quiz attempts"
+        )
+
+
+@router.get(
+    "/attempts/recent/{limit}",
+    summary="Get Recent Attempts",
+    description="Retrieve recent quiz attempts across all quizzes, sorted by submission date (newest first)"
+)
+async def get_recent_attempts(
+    limit: int = Path(..., ge=1, le=100, description="Maximum number of attempts to return (1-100)")
+):
+    """
+    Get recent quiz attempts across all quizzes
+    
+    Args:
+        limit: Maximum number of attempts to return
+    
+    Returns:
+        List of recent attempts sorted by date (newest first)
+        
+    Example response:
+        [
+            {"score": 5, "total": 5, "submitted_at": "2025-12-08T10:30:00Z"},
+            {"score": 3, "total": 5, "submitted_at": "2025-12-08T09:15:00Z"},
+            {"score": 4, "total": 5, "submitted_at": "2025-12-07T15:20:00Z"}
+        ]
+    """
+    try:
+        quiz_service = get_quiz_service()
+        attempts = await quiz_service.get_recent_attempts(limit)
+        
+        # Format response
+        return [
+            {
+                "score": attempt["score"],
+                "total": attempt["total"],
+                "submitted_at": attempt["submitted_at"].isoformat()
+            }
+            for attempt in attempts
+        ]
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to get recent attempts: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to retrieve recent attempts"
+        )
+
+

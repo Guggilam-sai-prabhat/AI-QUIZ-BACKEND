@@ -15,7 +15,11 @@ from app.db.qdrant import connect_to_qdrant, close_qdrant_connection, get_qdrant
 from app.api.document import router as documents_router
 from app.api.search import router as search_router
 from app.api.quiz import router as quiz_router
-from app.mcp_server.routes import router as mcp_router
+
+
+# NEW: Import the new quiz routers
+from app.api.start_session import router as start_session_router
+from app.api.next_question import router as next_question_router
 
 # Configure logging
 logging.basicConfig(
@@ -89,13 +93,14 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Quiz App API",
     description="""
-    Quiz App API with document management, semantic search, and MCP server.
+    Quiz App API with document management, semantic search, adaptive quiz system, and MCP server.
     
     ## Features
     - **Document Management**: Upload, retrieve, update, and delete documents
     - **Semantic Search**: Find relevant content using natural language queries
+    - **Adaptive Quiz System**: AI-powered question generation with difficulty adaptation
     - **Vector Embeddings**: Powered by SentenceTransformers and Qdrant
-    - **MongoDB Storage**: Persistent document metadata and content
+    - **MongoDB Storage**: Persistent document metadata and quiz sessions
     - **MCP Server**: Model Context Protocol for AI context provision
     
     ## Endpoints
@@ -103,6 +108,10 @@ app = FastAPI(
     - **Search**: `/api/search-context` - Semantic search across documents
     - **Search Health**: `/api/search-health` - Check search service status
     - **Collection Info**: `/api/collection-info` - View collection statistics
+    - **Quiz**: `/api/quiz/*` - Quiz management and generation
+    - **Quiz Sessions**: 
+        - `/api/quiz/start-session` - Start a new adaptive quiz session
+        - `/api/quiz/next-question` - Generate next adaptive question
     - **MCP**: `/mcp/*` - Model Context Protocol endpoints
     - **Health**: `/health` - Overall service health check
     """,
@@ -161,10 +170,15 @@ app.include_router(documents_router, prefix="/api", tags=["Documents"])
 app.include_router(search_router, prefix="/api", tags=["Search"])
 
 # MCP Server API 
-app.include_router(mcp_router, tags=["MCP Server"])
 
-#Quiz API
-app.include_router(quiz_router , tags=["Quiz"])
+
+# Quiz API (existing)
+app.include_router(quiz_router, tags=["Quiz"])
+
+# NEW: Adaptive Quiz Session Routers
+# Note: These routers already have prefix="/api/quiz" defined in them
+app.include_router(start_session_router, tags=["Adaptive Quiz"])
+app.include_router(next_question_router, tags=["Adaptive Quiz"])
 
 
 # ==================== ROOT ENDPOINTS ====================
@@ -183,9 +197,21 @@ async def root():
             "search": "/api/search-context",
             "search_health": "/api/search-health",
             "collection_info": "/api/collection-info",
+            "quiz": "/api/quiz",
+            "start_session": "/api/quiz/start-session",
+            "next_question": "/api/quiz/next-question",
             "mcp_status": "/mcp/status",
             "mcp_materials": "/mcp/materials",
             "health": "/health"
+        },
+        "new_features": {
+            "adaptive_quiz": {
+                "description": "AI-powered adaptive quiz system",
+                "endpoints": [
+                    "POST /api/quiz/start-session - Start a new quiz session",
+                    "POST /api/quiz/next-question - Get next adaptive question"
+                ]
+            }
         }
     }
 
