@@ -1,7 +1,7 @@
 """
-Next Question API Routes
+Next Question API Routes - Part 1
 LLM orchestrates retrieval and difficulty adaptation using MCP tools
-UPDATED: Properly handles first question in session
+UPDATED: Properly handles quiz completion detection
 """
 import logging
 from fastapi import APIRouter, HTTPException, Depends, status
@@ -11,10 +11,6 @@ from app.models.next_question import (
     NextQuestionRequest,
     NextQuestionResponse,
     ErrorResponse
-)
-from app.models.sumbit_answer import (
-    SubmitAnswerRequest,
-    SubmitAnswerResponse
 )
 
 from app.services.next_question_service import (
@@ -26,6 +22,15 @@ from app.services.next_question_service import (
 )
 from app.services.quiz_session_service import QuizSessionService
 from app.services.qdrant_service import QdrantService, get_qdrant_service
+
+from app.models.sumbit_answer import (
+    SubmitAnswerRequest,
+    SubmitAnswerResponse
+)
+from app.models.complete_session import (
+    CompleteSessionRequest,
+    CompleteSessionResponse
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +81,7 @@ def get_quiz_session_service(
     status_code=status.HTTP_200_OK,
     responses={
         200: {
-            "description": "Successfully generated next question",
+            "description": "Successfully generated next question OR quiz completed",
             "model": NextQuestionResponse
         },
         400: {
@@ -92,19 +97,37 @@ def get_quiz_session_service(
             "model": ErrorResponse
         }
     },
-    summary="Generate next adaptive question via LLM + MCP orchestration",
+    summary="Generate next adaptive question via LLM + MCP orchestration with completion detection",
     description="""
     Generate the next question with LLM orchestrating ALL logic via MCP tools.
+    Backend now determines when quiz should end.
+    
+    **QUIZ COMPLETION:**
+    Backend checks completion conditions BEFORE generating questions:
+    - Rule 1: Max questions reached (default: 8, configurable)
+    - Rule 2: No content available at target difficulty
+    - Rule 3: All unique chunks exhausted (chunk reuse detected)
+    
+    When quiz completes, response includes:
+    - isQuizComplete: true
+    - completionReason: "Why quiz ended"
+    - All question fields: null
+    
+    When quiz continues, response includes:
+    - isQuizComplete: false
+    - completionReason: null
+    - Full question data
     
     **FIRST QUESTION HANDLING:**
     - Backend automatically detects if session has no questions
-    - Sets isFirst=true and currentDifficulty="medium"
+    - Sets isFirst=true and currentDifficulty="easy"
     - LLM skips compute_next_difficulty tool
     - LLM calls record_question_event with wasCorrect=null
     
     **SUBSEQUENT QUESTIONS:**
     - Backend validates wasCorrect and previousQuestionId are provided
-    - LLM calls compute_next_difficulty based on previous answer
+    - Backend checks if quiz should end
+    - If not ended: LLM calls compute_next_difficulty based on previous answer
     - LLM adapts difficulty and retrieves appropriate content
     - LLM records event with actual wasCorrect value
     
@@ -112,25 +135,9 @@ def get_quiz_session_service(
     The LLM handles ALL workflow logic via tool calls. The backend only:
     - Validates session exists
     - Detects first question state
+    - Checks quiz completion conditions
     - Forwards tool execution results
     - Stores question metadata securely
-    
-    **Tool Orchestration Workflow:**
-    
-    First Question (isFirst=true):
-    1. LLM receives isFirst=true flag
-    2. Skips compute_next_difficulty
-    3. Calls get_chunk_by_difficulty(difficulty="medium")
-    4. Generates MCQ from retrieved chunk
-    5. Calls record_question_event(wasCorrect=null)
-    6. Returns structured JSON
-    
-    Subsequent Questions (isFirst=false):
-    1. LLM calls compute_next_difficulty(currentDifficulty, wasCorrect)
-    2. Calls get_chunk_by_difficulty(materialId, adaptedDifficulty)
-    3. Generates MCQ from retrieved chunk
-    4. Calls record_question_event(sessionId, questionId, difficulty, wasCorrect)
-    5. Returns structured JSON
     
     **SECURITY:** Correct answer never exposed in response, stored in session for evaluation.
     """
@@ -141,9 +148,9 @@ async def get_next_question(
     session_service: QuizSessionService = Depends(get_quiz_session_service)
 ) -> NextQuestionResponse:
     """
-    Generate next adaptive question via LLM + MCP orchestration
+    Generate next adaptive question via LLM + MCP orchestration with quiz completion
     
-    UPDATED: Automatically detects and handles first question correctly
+    UPDATED: Now returns completion signal when quiz should end
     
     Args:
         request: NextQuestionRequest with session and answer data
@@ -151,14 +158,15 @@ async def get_next_question(
         session_service: QuizSessionService for session state checking
     
     Returns:
-        NextQuestionResponse with new question (WITHOUT correct answer)
+        NextQuestionResponse with:
+        - If quiz continues: full question data + isQuizComplete=false
+        - If quiz ends: isQuizComplete=true + completionReason
     
     Raises:
         HTTPException: With appropriate status code and error details
     """
     try:
         # AUTO-DETECT FIRST QUESTION
-        # Check if session has any questions yet
         is_actually_first = await session_service.is_first_question(request.sessionId)
         
         # Override request if client didn't set it correctly
@@ -168,13 +176,15 @@ async def get_next_question(
                 f"Session has no questions, setting isFirst=True"
             )
             request.isFirst = True
-            request.currentDifficulty = "medium"  # Force medium for first question
+            request.currentDifficulty = "easy"  # Force easy for first question
+        
         if request.isFirst and request.currentDifficulty != "easy":
             logger.info(
                 f"🔄 Auto-correcting difficulty for first question: "
                 f"{request.currentDifficulty} -> easy"
             )
             request.currentDifficulty = "easy"
+        
         # Log request details
         logger.info(
             f"🎯 Next question request - "
@@ -190,7 +200,7 @@ async def get_next_question(
                 f"WasCorrect={request.wasCorrect}"
             )
         
-        # Generate question via MCP orchestration
+        # Generate question via MCP orchestration (with completion check)
         result = await service.generate_next_question(
             session_id=request.sessionId,
             material_id=request.materialId,
@@ -200,6 +210,31 @@ async def get_next_question(
             previous_question_id=request.previousQuestionId
         )
         
+        # CHECK IF QUIZ COMPLETED
+        if result.get("isQuizComplete"):
+            logger.info(
+                f"🏁 Quiz completed for session {request.sessionId} - "
+                f"Reason: {result.get('completionReason')}"
+            )
+            
+            # Auto-complete session status
+            await session_service.update_session_status(
+                session_id=request.sessionId,
+                status="completed"
+            )
+            
+            return NextQuestionResponse(
+                questionId=None,
+                question=None,
+                options=None,
+                difficulty=None,
+                difficultyChanged=None,
+                previousDifficulty=None,
+                isQuizComplete=True,
+                completionReason=result.get("completionReason")
+            )
+        
+        # Quiz continues - return question
         logger.info(
             f"✅ Next question generated - "
             f"QuestionId: {result['questionId']}, "
@@ -210,7 +245,6 @@ async def get_next_question(
         return NextQuestionResponse(**result)
     
     except ValueError as e:
-        # Session validation errors
         logger.error(f"❌ Validation error: {e}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -233,9 +267,21 @@ async def get_next_question(
     
     except NoContentAvailableError as e:
         logger.warning(f"⚠️ No content available: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e)
+        # This is now handled as quiz completion
+        logger.info(f"🏁 Quiz completed - no content available")
+        await session_service.update_session_status(
+            session_id=request.sessionId,
+            status="completed"
+        )
+        return NextQuestionResponse(
+            questionId=None,
+            question=None,
+            options=None,
+            difficulty=None,
+            difficultyChanged=None,
+            previousDifficulty=None,
+            isQuizComplete=True,
+            completionReason="No more content available"
         )
     
     except MCPOrchestrationError as e:
@@ -251,7 +297,6 @@ async def get_next_question(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An unexpected error occurred while generating the question"
         )
-
 
 @router.post(
     "/submit-answer",
@@ -369,6 +414,159 @@ async def submit_answer(
         )
 
 
+@router.post(
+    "/complete",
+    response_model=CompleteSessionResponse,
+    status_code=status.HTTP_200_OK,
+    responses={
+        200: {
+            "description": "Session completed successfully",
+            "model": CompleteSessionResponse
+        },
+        400: {
+            "description": "Invalid request or session already completed",
+            "model": ErrorResponse
+        },
+        404: {
+            "description": "Session not found",
+            "model": ErrorResponse
+        },
+        500: {
+            "description": "Internal server error",
+            "model": ErrorResponse
+        }
+    },
+    summary="Complete quiz session and get final score",
+    description="""
+    Mark a quiz session as completed and compute the final score.
+    
+    **Behavior:**
+    - Marks the session status as "completed"
+    - Computes final score from recorded answers
+    - Returns score summary with statistics
+    
+    **Important:**
+    - This endpoint does NOT call OpenAI
+    - No new questions are generated
+    - Session cannot be resumed after completion
+    
+    **Use Case:**
+    Call this when the user finishes the quiz or wants to end early.
+    This ensures the final answer is properly recorded in session stats.
+    
+    **Note:**
+    With the new completion detection, the /next-question endpoint will
+    automatically mark the session as completed when quiz ends. This endpoint
+    is for manual completion or when user quits early.
+    """
+)
+async def complete_session(
+    request: CompleteSessionRequest,
+    session_service: QuizSessionService = Depends(get_quiz_session_service)
+) -> CompleteSessionResponse:
+    """
+    Complete quiz session and return final score
+    
+    Args:
+        request: CompleteSessionRequest with sessionId
+        session_service: QuizSessionService instance (injected)
+    
+    Returns:
+        CompleteSessionResponse with score statistics
+    
+    Raises:
+        HTTPException: With appropriate status code and error details
+    """
+    try:
+        logger.info(f"🏁 Completing session: {request.sessionId}")
+        
+        # Get session to validate it exists
+        session = await session_service.get_session(request.sessionId)
+        
+        if not session:
+            raise ValueError(f"Session not found: {request.sessionId}")
+        
+        # Check if already completed
+        if session.status == "completed":
+            logger.warning(f"⚠️ Session {request.sessionId} is already completed")
+            # Still return the score, don't error
+        
+        # Compute score
+        score_data = compute_score(session.questions)
+        
+        # Mark session as completed (if not already)
+        if session.status != "completed":
+            await session_service.update_session_status(
+                session_id=request.sessionId,
+                status="completed"
+            )
+        
+        response = CompleteSessionResponse(
+            sessionId=request.sessionId,
+            score=score_data["score"],
+            totalQuestions=score_data["totalQuestions"],
+            correct=score_data["correct"],
+            percentage=score_data["percentage"],
+            status="completed"
+        )
+        
+        logger.info(
+            f"✅ Session completed - "
+            f"Session: {request.sessionId}, "
+            f"Score: {score_data['correct']}/{score_data['totalQuestions']} "
+            f"({score_data['percentage']:.1f}%)"
+        )
+        
+        return response
+    
+    except ValueError as e:
+        logger.error(f"❌ Validation error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e)
+        )
+    
+    except Exception as e:
+        logger.error(f"❌ Unexpected error completing session: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while completing the session"
+        )
+
+
+# ============================================================================
+# HELPER FUNCTION
+# ============================================================================
+
+def compute_score(questions: list) -> dict:
+    """
+    Compute score from list of question records
+    
+    Args:
+        questions: List of QuestionRecord objects
+    
+    Returns:
+        Dictionary with score statistics
+    """
+    total = len(questions)
+    
+    # Count correct answers (exclude None values for first question edge case)
+    correct = sum(
+        1 for q in questions 
+        if q.wasCorrect is not None and q.wasCorrect
+    )
+    
+    # Calculate percentage (avoid division by zero)
+    percentage = (correct / total * 100) if total > 0 else 0.0
+    
+    return {
+        "score": correct,  # Same as correct, for clarity
+        "totalQuestions": total,
+        "correct": correct,
+        "percentage": round(percentage, 2)
+    }
+
+
 @router.get(
     "/health",
     status_code=status.HTTP_200_OK,
@@ -418,5 +616,7 @@ async def health_check(
         },
         "mcp_orchestration": "enabled",
         "first_question_handling": "automatic",
-        "description": "LLM orchestrates all question generation via MCP tools"
+        "quiz_completion": "automatic",
+        "max_questions": 8,
+        "description": "LLM orchestrates all question generation via MCP tools with automatic quiz completion"
     }

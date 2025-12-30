@@ -1,9 +1,10 @@
 """
-Quiz Session Service
-MongoDB service functions for quiz sessions with answer evaluation
+Quiz Session Service - Extended with Quiz Completion Logic
+MongoDB service functions for quiz sessions with answer evaluation and end conditions
+FIXED: Matches your existing schema where QuestionRecord includes correctAnswer
 """
 from datetime import datetime
-from typing import Optional, Literal, Tuple
+from typing import Optional, Literal, Tuple, List
 import logging
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -17,21 +18,27 @@ from app.models.quiz_sessions import (
 
 logger = logging.getLogger(__name__)
 
+# CONFIGURABLE QUIZ END RULES
+MAX_QUESTIONS = 8  # Default maximum questions per quiz
+ALLOW_CHUNK_REUSE = False  # Whether to allow same chunk twice
+
 
 class QuizSessionService:
-    """Service class for quiz session operations"""
+    """Service class for quiz session operations with completion detection"""
     
     COLLECTION_NAME = "quiz_sessions"
     
-    def __init__(self, db: AsyncIOMotorDatabase):
+    def __init__(self, db: AsyncIOMotorDatabase, max_questions: int = MAX_QUESTIONS):
         """
         Initialize quiz session service
         
         Args:
             db: MongoDB database instance
+            max_questions: Maximum questions per quiz (default: 8)
         """
         self.db = db
         self.collection = db[self.COLLECTION_NAME]
+        self.max_questions = max_questions
     
     async def create_session(self, material_id: str) -> QuizSession:
         """
@@ -66,7 +73,7 @@ class QuizSessionService:
         
         Args:
             session_id: ID of the quiz session
-            metadata: Complete question metadata including correct answer
+            metadata: Complete question metadata including correct answer and optional chunkId
         
         Returns:
             True if successful
@@ -103,21 +110,34 @@ class QuizSessionService:
     async def append_question(
         self,
         session_id: str,
-        record: QuestionRecord
+        question_id: str,
+        difficulty: str,
+        correct_answer: str,
+        was_correct: Optional[bool] = None
     ) -> bool:
         """
         Append a question answer record to session
         
-        UPDATED: Supports wasCorrect=None for first question
+        UPDATED: Matches your schema where QuestionRecord includes correctAnswer
         
         Args:
             session_id: ID of the quiz session
-            record: QuestionRecord with answer result (wasCorrect can be None)
+            question_id: Question identifier
+            difficulty: Question difficulty level
+            correct_answer: The correct answer (A, B, C, D)
+            was_correct: Whether answer was correct (None for first question)
         
         Returns:
             True if successful
         """
         try:
+            record = QuestionRecord(
+                questionId=question_id,
+                difficulty=difficulty,
+                correctAnswer=correct_answer,
+                wasCorrect=was_correct
+            )
+            
             result = await self.collection.update_one(
                 {"sessionId": session_id},
                 {
@@ -132,12 +152,12 @@ class QuizSessionService:
             
             if result.modified_count > 0:
                 correctness_str = (
-                    "N/A (first question)" if record.wasCorrect is None 
-                    else str(record.wasCorrect)
+                    "N/A (first question)" if was_correct is None 
+                    else str(was_correct)
                 )
                 logger.info(
                     f"✅ Appended answer record to session {session_id} - "
-                    f"Question: {record.questionId}, Correct: {correctness_str}"
+                    f"Question: {question_id}, Correct: {correctness_str}"
                 )
                 return True
             
@@ -249,6 +269,124 @@ class QuizSessionService:
         except Exception as e:
             logger.error(f"❌ Failed to check if first question for session {session_id}: {e}")
             raise Exception(f"Failed to check session state: {str(e)}")
+    
+    # ============================================================================
+    # QUIZ COMPLETION LOGIC - NEW METHODS
+    # ============================================================================
+    
+    async def count_questions(self, session_id: str) -> int:
+        """
+        Count total questions in session
+        
+        Args:
+            session_id: Quiz session ID
+        
+        Returns:
+            Number of questions in session
+        """
+        try:
+            session = await self.get_session(session_id)
+            if not session:
+                raise ValueError(f"Session not found: {session_id}")
+            
+            # Count based on questionMetadata (generated questions)
+            count = len(session.questionMetadata)
+            logger.debug(f"📊 Session {session_id} has {count} questions")
+            return count
+        
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"❌ Failed to count questions for session {session_id}: {e}")
+            raise Exception(f"Failed to count questions: {str(e)}")
+    
+    async def get_used_chunk_ids(self, session_id: str) -> List[str]:
+        """
+        Get list of chunk IDs already used in this session
+        
+        Args:
+            session_id: Quiz session ID
+        
+        Returns:
+            List of chunk IDs used in questionMetadata
+        """
+        try:
+            session = await self.get_session(session_id)
+            if not session:
+                raise ValueError(f"Session not found: {session_id}")
+            
+            # Extract chunk IDs from metadata if stored
+            chunk_ids = []
+            for metadata in session.questionMetadata:
+                # Get chunkId if it exists
+                chunk_id = getattr(metadata, 'chunkId', None)
+                if chunk_id:
+                    chunk_ids.append(chunk_id)
+            
+            logger.debug(f"📊 Session {session_id} used chunks: {chunk_ids}")
+            return chunk_ids
+        
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"❌ Failed to get used chunks for session {session_id}: {e}")
+            raise Exception(f"Failed to get used chunks: {str(e)}")
+    
+    async def should_end_quiz(
+        self,
+        session_id: str,
+        retrieved_chunk_id: Optional[str] = None
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Determine if quiz should end based on multiple conditions
+        
+        Args:
+            session_id: Quiz session ID
+            retrieved_chunk_id: Optional chunk ID that was just retrieved
+        
+        Returns:
+            Tuple of (should_end, reason)
+            - should_end: True if quiz should end
+            - reason: Explanation why quiz ended (if applicable)
+        
+        Completion Rules:
+        1. Max questions reached (configurable)
+        2. Chunk reuse detected (if not allowed)
+        3. No content available (handled upstream)
+        """
+        try:
+            session = await self.get_session(session_id)
+            if not session:
+                raise ValueError(f"Session not found: {session_id}")
+            
+            # Rule 1: Check max questions limit
+            question_count = len(session.questionMetadata)
+            if question_count >= self.max_questions:
+                reason = f"Maximum {self.max_questions} questions reached"
+                logger.info(f"🏁 Session {session_id} ending: {reason}")
+                return (True, reason)
+            
+            # Rule 2: Check chunk reuse (if provided and not allowed)
+            if not ALLOW_CHUNK_REUSE and retrieved_chunk_id:
+                used_chunks = await self.get_used_chunk_ids(session_id)
+                if retrieved_chunk_id in used_chunks:
+                    reason = "All unique content exhausted (chunk reuse detected)"
+                    logger.info(f"🏁 Session {session_id} ending: {reason}")
+                    return (True, reason)
+            
+            # No end condition met
+            logger.debug(f"✅ Session {session_id} should continue")
+            return (False, None)
+        
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"❌ Failed to check end condition for session {session_id}: {e}")
+            raise Exception(f"Failed to check end condition: {str(e)}")
+    
+    # ============================================================================
+    # EXISTING METHODS (unchanged)
+    # ============================================================================
     
     async def update_session_status(
         self,

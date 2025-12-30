@@ -1,6 +1,6 @@
 """
 Next Question Request/Response Models
-Handles first question and adaptive subsequent questions
+Handles first question and adaptive subsequent questions with quiz completion
 """
 from pydantic import BaseModel, Field, model_validator
 from typing import Literal, Optional
@@ -44,21 +44,31 @@ class NextQuestionResponse(BaseModel):
     
     SECURITY: Does NOT include the correct answer
     Answer is stored in session for evaluation during submission
+    
+    NEW: Includes isQuizComplete to signal when backend determines quiz should end
     """
-    questionId: str = Field(..., description="Unique question identifier")
-    question: str = Field(..., description="Question text")
-    options: list[str] = Field(..., description="List of 4 answer options")
-    difficulty: Literal["easy", "medium", "hard"] = Field(
-        ..., 
-        description="Question difficulty level"
+    questionId: Optional[str] = Field(None, description="Unique question identifier (None if quiz complete)")
+    question: Optional[str] = Field(None, description="Question text (None if quiz complete)")
+    options: Optional[list[str]] = Field(None, description="List of 4 answer options (None if quiz complete)")
+    difficulty: Optional[Literal["easy", "medium", "hard"]] = Field(
+        None, 
+        description="Question difficulty level (None if quiz complete)"
     )
-    difficultyChanged: bool = Field(
-        ..., 
-        description="Whether difficulty was adjusted from previous level"
+    difficultyChanged: Optional[bool] = Field(
+        None, 
+        description="Whether difficulty was adjusted from previous level (None if quiz complete)"
     )
-    previousDifficulty: str = Field(
+    previousDifficulty: Optional[str] = Field(
+        None, 
+        description="Previous difficulty level (None if quiz complete)"
+    )
+    isQuizComplete: bool = Field(
         ..., 
-        description="Previous difficulty level"
+        description="Whether the quiz should end (True = no more questions, False = continue)"
+    )
+    completionReason: Optional[str] = Field(
+        None,
+        description="Reason why quiz ended (if isQuizComplete=True)"
     )
     
     class Config:

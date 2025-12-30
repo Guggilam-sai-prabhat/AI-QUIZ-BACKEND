@@ -1,16 +1,17 @@
 """
-Next Question Service - Full MCP Orchestration
+Next Question Service - Full MCP Orchestration with Quiz Completion
 LLM orchestrates ALL retrieval, difficulty, generation, and session logic via MCP tools
-Backend only forwards tool calls - NO logic injection
+Backend handles quiz completion detection
+FIXED: Matches your existing QuizSession schema
 """
 import json
 import logging
 import os
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 from motor.motor_asyncio import AsyncIOMotorDatabase
 import openai
 
-from app.models.quiz_sessions import QuestionMetadata, QuestionRecord
+from app.models.quiz_sessions import QuestionMetadata
 from app.services.quiz_session_service import QuizSessionService
 from app.services.qdrant_service import QdrantService
 
@@ -44,7 +45,7 @@ class MCPOrchestrationError(NextQuestionServiceError):
 
 class NextQuestionService:
     """
-    Service for adaptive next question generation via full MCP orchestration.
+    Service for adaptive next question generation via full MCP orchestration with completion detection.
     
     The LLM orchestrates EVERYTHING:
     - Difficulty adaptation via compute_next_difficulty tool
@@ -52,7 +53,10 @@ class NextQuestionService:
     - MCQ generation strictly from retrieved chunk (NO fabrication)
     - Session recording via record_question_event tool
     
-    Backend role: Forward tool calls and return results (NO logic injection)
+    Backend role: 
+    - Forward tool calls and return results
+    - Check quiz completion conditions
+    - Signal when quiz should end
     """
     
     # MCP Tool Definitions
@@ -134,12 +138,17 @@ class NextQuestionService:
                             "enum": ["easy", "medium", "hard"],
                             "description": "Difficulty level of the question"
                         },
+                        "correctAnswer": {
+                            "type": "string",
+                            "enum": ["A", "B", "C", "D"],
+                            "description": "The correct answer for the question"
+                        },
                         "wasCorrect": {
                             "type": "boolean",
                             "description": "Whether the user answered correctly"
                         }
                     },
-                    "required": ["sessionId", "questionId", "difficulty", "wasCorrect"]
+                    "required": ["sessionId", "questionId", "difficulty", "correctAnswer", "wasCorrect"]
                 }
             }
         }
@@ -157,7 +166,7 @@ class NextQuestionService:
 
 ## FOR FIRST QUESTION:
 
-Step 1: Call get_chunk_by_difficulty(materialId, difficulty="medium")
+Step 1: Call get_chunk_by_difficulty(materialId, difficulty="easy")
 Step 2: Wait for chunk text
    - The tool may return a fallback chunk at a different difficulty
    - If "fallback": true, note the actual "difficulty" field
@@ -177,7 +186,7 @@ Step 1: Call compute_next_difficulty(currentDifficulty, wasCorrect)
 Step 2: Call get_chunk_by_difficulty(materialId, difficulty=<result from step 1>)
    - The tool may return a fallback chunk at a different difficulty
    - If "fallback": true, note the actual "difficulty" field
-Step 3: Call record_question_event(sessionId, questionId, difficulty, wasCorrect)
+Step 3: Call record_question_event(sessionId, questionId, difficulty, correctAnswer, wasCorrect)
 Step 4: Create MCQ from chunk
 Step 5: Return JSON using the ACTUAL difficulty from the tool response
 
@@ -213,51 +222,8 @@ Example:
 ❌ NEVER add markdown backticks around JSON
 ❌ NEVER add explanatory text with the JSON
 
-## EXAMPLES:
-
-**Example 1: Successful retrieval at requested difficulty**
-TOOL RESPONSE: {
-  "chunkId": "123",
-  "text": "Python is a programming language...",
-  "difficulty": "medium",
-  "fallback": false
-}
-YOUR JSON: {
-  "questionId": "550e8400-e29b-41d4-a716-446655440000",
-  "question": "What is Python?",
-  "options": ["A language", "A snake", "A framework", "A database"],
-  "answer": "A",
-  "difficulty": "medium"
-}
-
-**Example 2: Fallback to different difficulty**
-TOOL RESPONSE: {
-  "chunkId": "456",
-  "text": "Variables store data...",
-  "difficulty": "easy",
-  "requestedDifficulty": "medium",
-  "fallback": true,
-  "fallbackMessage": "Using 'easy' difficulty ('medium' not available)"
-}
-YOUR JSON: {
-  "questionId": "550e8400-e29b-41d4-a716-446655440001",
-  "question": "What do variables do?",
-  "options": ["Store data", "Run code", "Delete files", "Print text"],
-  "answer": "A",
-  "difficulty": "easy"  ← USE "easy" from tool response, NOT "medium"
-}
-
-**Example 3: No content available**
-TOOL RESPONSE: {
-  "error": "no_content_available",
-  "message": "No content available for material..."
-}
-YOUR JSON: {
-  "error": "no_content_available",
-  "message": "No content available"
-}
-
 Remember: The difficulty in your JSON must ALWAYS match the difficulty field from the tool response."""
+
     def __init__(
         self,
         db: AsyncIOMotorDatabase,
@@ -297,7 +263,9 @@ Remember: The difficulty in your JSON must ALWAYS match the difficulty field fro
         previous_question_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Generate next question via full MCP orchestration.
+        Generate next question via full MCP orchestration with completion checking.
+        
+        UPDATED: Now checks if quiz should end BEFORE generating question
         
         The LLM handles ALL logic via tools:
         - Difficulty computation (if not first)
@@ -314,7 +282,7 @@ Remember: The difficulty in your JSON must ALWAYS match the difficulty field fro
             previous_question_id: ID of previous question (required if not first)
         
         Returns:
-            Dictionary with question data (WITHOUT correct answer for API)
+            Dictionary with question data OR completion signal
         
         Raises:
             NextQuestionServiceError: If generation fails
@@ -328,6 +296,19 @@ Remember: The difficulty in your JSON must ALWAYS match the difficulty field fro
         
         # Validate session
         await self._validate_session(session_id, material_id)
+        
+        # CHECK IF QUIZ SHOULD END (before generating)
+        # This checks max questions limit
+        should_end, end_reason = await self.session_service.should_end_quiz(
+            session_id=session_id
+        )
+        
+        if should_end:
+            logger.info(f"🏁 Quiz ending for session {session_id}: {end_reason}")
+            return {
+                "isQuizComplete": True,
+                "completionReason": end_reason
+            }
         
         # Validate subsequent question requirements
         if not is_first:
@@ -351,14 +332,36 @@ Remember: The difficulty in your JSON must ALWAYS match the difficulty field fro
         )
         
         # Orchestrate with LLM
-        question_data = await self._orchestrate_with_llm(
-            user_prompt=user_prompt,
-            session_id=session_id,
-            material_id=material_id
-        )
+        try:
+            question_data = await self._orchestrate_with_llm(
+                user_prompt=user_prompt,
+                session_id=session_id,
+                material_id=material_id
+            )
+        except NoContentAvailableError as e:
+            # If no content available, end quiz
+            logger.info(f"🏁 Quiz ending for session {session_id}: No content available")
+            return {
+                "isQuizComplete": True,
+                "completionReason": "No more content available at requested difficulty"
+            }
+        
+        # Check if chunk was reused (if we have chunkId)
+        chunk_id = question_data.get("chunkId")
+        if chunk_id:
+            should_end_chunk, end_reason_chunk = await self.session_service.should_end_quiz(
+                session_id=session_id,
+                retrieved_chunk_id=chunk_id
+            )
+            
+            if should_end_chunk:
+                logger.info(f"🏁 Quiz ending for session {session_id}: {end_reason_chunk}")
+                return {
+                    "isQuizComplete": True,
+                    "completionReason": end_reason_chunk
+                }
         
         # Store complete question metadata in session (includes correct answer)
-       
         await self._store_question_metadata(session_id, question_data)
 
         # Extract difficulty from question data
@@ -373,8 +376,10 @@ Remember: The difficulty in your JSON must ALWAYS match the difficulty field fro
             "question": question_data["question"],
             "options": question_data["options"],
             "difficulty": new_difficulty,
-            "difficultyChanged": difficulty_changed,  # ADD THIS LINE
-            "previousDifficulty": current_difficulty
+            "difficultyChanged": difficulty_changed,
+            "previousDifficulty": current_difficulty,
+            "isQuizComplete": False,  # NEW: Quiz continues
+            "completionReason": None  # NEW: No completion reason
         }
 
         logger.info(
@@ -400,77 +405,77 @@ Remember: The difficulty in your JSON must ALWAYS match the difficulty field fro
         if is_first:
             return f"""Generate the FIRST question for this quiz session.
 
-    **Session Context:**
-    - Session ID: {session_id}
-    - Material ID: {material_id}
-    - Preferred Starting Difficulty: medium
-    - Is First Question: true
+**Session Context:**
+- Session ID: {session_id}
+- Material ID: {material_id}
+- Preferred Starting Difficulty: easy
+- Is First Question: true
 
-    **Your Task:**
+**Your Task:**
 
-    1. Call get_chunk_by_difficulty(materialId="{material_id}", difficulty="medium")
+1. Call get_chunk_by_difficulty(materialId="{material_id}", difficulty="easy")
 
-    2. Wait for the tool response:
-    - If you receive a chunk (with or without fallback flag), proceed to step 3
-    - The tool will automatically try other difficulties if "medium" is not available
-    - ALWAYS use the "difficulty" value from the tool response in your final JSON
+2. Wait for the tool response:
+   - If you receive a chunk (with or without fallback flag), proceed to step 3
+   - The tool will automatically try other difficulties if "easy" is not available
+   - ALWAYS use the "difficulty" value from the tool response in your final JSON
 
-    3. Generate a multiple-choice question from the chunk
+3. Generate a multiple-choice question from the chunk
 
-    4. Return ONLY this JSON (no markdown, no explanation):
-    {{
-    "questionId": "<generate-uuid-v4>",
-    "question": "Your question here?",
-    "options": ["Option A", "Option B", "Option C", "Option D"],
-    "answer": "A",
-    "difficulty": "<USE THE 'difficulty' FIELD FROM TOOL RESPONSE>"
-    }}
+4. Return ONLY this JSON (no markdown, no explanation):
+{{
+  "questionId": "<generate-uuid-v4>",
+  "question": "Your question here?",
+  "options": ["Option A", "Option B", "Option C", "Option D"],
+  "answer": "A",
+  "difficulty": "<USE THE 'difficulty' FIELD FROM TOOL RESPONSE>"
+}}
 
-    **CRITICAL:**
-    - The difficulty in your JSON must match the difficulty from the tool response
-    - If tool returns difficulty="easy", your JSON must have difficulty="easy"
-    - If tool returns difficulty="hard", your JSON must have difficulty="hard"
-    - DO NOT hardcode difficulty="medium" if the tool returned something else
+**CRITICAL:**
+- The difficulty in your JSON must match the difficulty from the tool response
+- If tool returns difficulty="easy", your JSON must have difficulty="easy"
+- If tool returns difficulty="hard", your JSON must have difficulty="hard"
+- DO NOT hardcode difficulty="easy" if the tool returned something else
 
-    Begin now."""
+Begin now."""
         
         else:
             return f"""Generate the NEXT question for this quiz session.
 
-    **Session Context:**
-    - Session ID: {session_id}
-    - Material ID: {material_id}
-    - Previous Difficulty: {current_difficulty}
-    - Previous Question ID: {previous_question_id}
-    - User Was Correct: {was_correct}
+**Session Context:**
+- Session ID: {session_id}
+- Material ID: {material_id}
+- Previous Difficulty: {current_difficulty}
+- Previous Question ID: {previous_question_id}
+- User Was Correct: {was_correct}
 
-    **Your Task:**
+**Your Task:**
 
-    1. Call compute_next_difficulty(currentDifficulty="{current_difficulty}", wasCorrect={str(was_correct).lower()})
+1. Call compute_next_difficulty(currentDifficulty="{current_difficulty}", wasCorrect={str(was_correct).lower()})
 
-    2. Call get_chunk_by_difficulty(materialId="{material_id}", difficulty=<nextDifficulty from step 1>)
-    - The tool will automatically try other difficulties if needed
-    - ALWAYS use the "difficulty" value from the tool response
+2. Call get_chunk_by_difficulty(materialId="{material_id}", difficulty=<nextDifficulty from step 1>)
+   - The tool will automatically try other difficulties if needed
+   - ALWAYS use the "difficulty" value from the tool response
 
-    3. Call record_question_event(sessionId="{session_id}", questionId="{previous_question_id}", difficulty="{current_difficulty}", wasCorrect={str(was_correct).lower()})
+3. Call record_question_event(sessionId="{session_id}", questionId="{previous_question_id}", difficulty="{current_difficulty}", correctAnswer="<use correct answer from previous question metadata>", wasCorrect={str(was_correct).lower()})
 
-    4. Generate a multiple-choice question from the chunk
+4. Generate a multiple-choice question from the chunk
 
-    5. Return ONLY this JSON (no markdown, no explanation):
-    {{
-    "questionId": "<generate-uuid-v4>",
-    "question": "Your question here?",
-    "options": ["Option A", "Option B", "Option C", "Option D"],
-    "answer": "A",
-    "difficulty": "<USE THE 'difficulty' FIELD FROM TOOL RESPONSE>"
-    }}
+5. Return ONLY this JSON (no markdown, no explanation):
+{{
+  "questionId": "<generate-uuid-v4>",
+  "question": "Your question here?",
+  "options": ["Option A", "Option B", "Option C", "Option D"],
+  "answer": "A",
+  "difficulty": "<USE THE 'difficulty' FIELD FROM TOOL RESPONSE>"
+}}
 
-    **CRITICAL:**
-    - Use the difficulty from the get_chunk_by_difficulty response
-    - If it returns "easy" due to fallback, use "easy" in your JSON
-    - Complete all 5 steps before returning JSON
+**CRITICAL:**
+- Use the difficulty from the get_chunk_by_difficulty response
+- If it returns "easy" due to fallback, use "easy" in your JSON
+- Complete all 5 steps before returning JSON
 
-    Begin now."""
+Begin now."""
     
     async def _orchestrate_with_llm(
         self,
@@ -481,11 +486,15 @@ Remember: The difficulty in your JSON must ALWAYS match the difficulty field fro
         """
         Orchestrate question generation with LLM via MCP tools.
         Handles tool call loop until final JSON response.
+        UPDATED: Tracks chunkId from tool responses
         """
         messages = [
             {"role": "system", "content": self.SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt}
         ]
+        
+        # Track chunk ID from get_chunk_by_difficulty tool response
+        retrieved_chunk_id = None
 
         try:
             iteration = 0
@@ -536,6 +545,11 @@ Remember: The difficulty in your JSON must ALWAYS match the difficulty field fro
 
                     # Parse & validate final MCQ JSON
                     question_data = self._parse_json_response(content)
+                    
+                    # ADD CHUNK ID to question data if we retrieved one
+                    if retrieved_chunk_id:
+                        question_data["chunkId"] = retrieved_chunk_id
+                        logger.info(f"📎 Attaching chunkId {retrieved_chunk_id} to question")
 
                     logger.info(
                         f"✅ LLM returned final MCQ: {question_data['questionId']} "
@@ -581,6 +595,11 @@ Remember: The difficulty in your JSON must ALWAYS match the difficulty field fro
                         session_id=session_id,
                         material_id=material_id
                     )
+                    
+                    # CAPTURE CHUNK ID from get_chunk_by_difficulty response
+                    if function_name == "get_chunk_by_difficulty" and "chunkId" in tool_result:
+                        retrieved_chunk_id = tool_result["chunkId"]
+                        logger.info(f"📎 Captured chunkId: {retrieved_chunk_id}")
 
                     messages.append({
                         "role": "tool",
@@ -601,9 +620,7 @@ Remember: The difficulty in your JSON must ALWAYS match the difficulty field fro
         except Exception as e:
             logger.error(f"❌ Orchestration error: {e}")
             raise MCPOrchestrationError(f"Orchestration failed: {str(e)}")
-
     
-
     async def _execute_mcp_tool(
         self,
         function_name: str,
@@ -614,12 +631,13 @@ Remember: The difficulty in your JSON must ALWAYS match the difficulty field fro
         """
         Execute MCP tool and return result.
         Backend only forwards tool calls - NO logic injection.
-        UPDATED: Added intelligent fallback for missing chunks
+        UPDATED: Added intelligent fallback for missing chunks and chunk ID tracking
+        FIXED: Use correct method signature for append_question matching your schema
         """
         
         try:
             if function_name == "compute_next_difficulty":
-                # Import adaptive difficulty function<|fim_middle|><|fim_middle|>
+                # Import adaptive difficulty function
                 from app.services.adaptive_difficulty import adjust_difficulty
                 
                 current = arguments["currentDifficulty"]
@@ -732,6 +750,7 @@ Remember: The difficulty in your JSON must ALWAYS match the difficulty field fro
                 session_id_arg = arguments["sessionId"]
                 question_id = arguments["questionId"]
                 difficulty = arguments["difficulty"]
+                correct_answer = arguments["correctAnswer"]
                 was_correct = arguments["wasCorrect"]
                 
                 # Validate session ID matches
@@ -740,17 +759,13 @@ Remember: The difficulty in your JSON must ALWAYS match the difficulty field fro
                         "error": f"Session ID mismatch: expected '{session_id}', got '{session_id_arg}'"
                     }
                 
-                # Create question record
-                record = QuestionRecord(
-                    questionId=question_id,
-                    difficulty=difficulty,
-                    wasCorrect=was_correct
-                )
-                
-                # Append to session
+                # Append question record using YOUR schema
                 await self.session_service.append_question(
                     session_id=session_id_arg,
-                    record=record
+                    question_id=question_id,
+                    difficulty=difficulty,
+                    correct_answer=correct_answer,
+                    was_correct=was_correct
                 )
                 
                 logger.info(
@@ -862,15 +877,24 @@ Remember: The difficulty in your JSON must ALWAYS match the difficulty field fro
         session_id: str,
         question_data: Dict[str, Any]
     ) -> None:
-        """Store complete question metadata in session (includes correct answer)"""
+        """
+        Store complete question metadata in session (includes correct answer and chunkId)
+        """
         try:
-            metadata = QuestionMetadata(
-                questionId=question_data["questionId"],
-                question=question_data["question"],
-                options=question_data["options"],
-                correctAnswer=question_data["answer"],
-                difficulty=question_data["difficulty"]
-            )
+            # Create metadata with optional chunkId
+            metadata_dict = {
+                "questionId": question_data["questionId"],
+                "question": question_data["question"],
+                "options": question_data["options"],
+                "correctAnswer": question_data["answer"],
+                "difficulty": question_data["difficulty"]
+            }
+            
+            # Add chunkId if present
+            if "chunkId" in question_data:
+                metadata_dict["chunkId"] = question_data["chunkId"]
+            
+            metadata = QuestionMetadata(**metadata_dict)
             
             await self.session_service.store_question_metadata(
                 session_id=session_id,
@@ -889,56 +913,3 @@ Remember: The difficulty in your JSON must ALWAYS match the difficulty field fro
             raise NextQuestionServiceError(
                 f"Failed to store question metadata: {str(e)}"
             )
-
-
-# Example usage
-async def main():
-    """Example demonstrating full MCP orchestration"""
-    from motor.motor_asyncio import AsyncIOMotorClient
-    
-    # Initialize services
-    client = AsyncIOMotorClient("mongodb://localhost:27017")
-    db = client["quiz_db"]
-    qdrant_service = QdrantService(url="http://localhost:6333")
-    
-    service = NextQuestionService(
-        db=db,
-        qdrant_service=qdrant_service,
-        openai_model="gpt-4o"
-    )
-    
-    try:
-        # Generate first question
-        print("🎯 Generating FIRST question...")
-        first_question = await service.generate_next_question(
-            session_id="session_123",
-            material_id="material_456",
-            current_difficulty="medium",
-            is_first=True
-        )
-        
-        print("\n✅ First Question Generated:")
-        print(json.dumps(first_question, indent=2))
-        print("\n" + "="*60 + "\n")
-        
-        # Generate next question (user got it right)
-        print("🎯 Generating NEXT question (user was correct)...")
-        next_question = await service.generate_next_question(
-            session_id="session_123",
-            material_id="material_456",
-            current_difficulty="medium",
-            is_first=False,
-            was_correct=True,
-            previous_question_id=first_question["questionId"]
-        )
-        
-        print("\n✅ Next Question Generated:")
-        print(json.dumps(next_question, indent=2))
-    
-    except NextQuestionServiceError as e:
-        print(f"\n❌ Error: {e}")
-
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())

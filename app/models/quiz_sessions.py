@@ -1,6 +1,7 @@
 """
 Quiz Session Models
 Updated to store correct answers in question records for later evaluation
+UPDATED: Added chunkId tracking for quiz completion logic
 """
 from datetime import datetime
 from typing import Literal, Optional, List
@@ -12,12 +13,14 @@ class QuestionMetadata(BaseModel):
     """
     Complete question metadata stored in session
     SECURITY: correctAnswer is stored here but NEVER exposed in /next-question
+    UPDATED: Added chunkId for duplicate detection in quiz completion
     """
     questionId: str = Field(..., description="Unique question identifier")
     question: str = Field(..., description="Question text")
     options: List[str] = Field(..., description="List of 4 answer options")
     correctAnswer: str = Field(..., description="Correct answer (A, B, C, or D) - PRIVATE")
     difficulty: Literal["easy", "medium", "hard"] = Field(..., description="Question difficulty")
+    chunkId: Optional[str] = Field(None, description="Source chunk ID (for duplicate detection)")
     
     class Config:
         json_schema_extra = {
@@ -26,7 +29,8 @@ class QuestionMetadata(BaseModel):
                 "question": "What is the time complexity of binary search?",
                 "options": ["O(n)", "O(log n)", "O(n^2)", "O(1)"],
                 "correctAnswer": "B",
-                "difficulty": "medium"
+                "difficulty": "medium",
+                "chunkId": "chunk_abc123"
             }
         }
 
@@ -35,11 +39,15 @@ class QuestionRecord(BaseModel):
     """
     Question record with user's answer result and stored correct answer
     This is appended after answer submission
+    UPDATED: wasCorrect can now be None for first question (recorded before answer)
     """
     questionId: str = Field(..., description="Question ID reference")
     difficulty: Literal["easy", "medium", "hard"] = Field(..., description="Question difficulty")
     correctAnswer: str = Field(..., description="Correct answer (A, B, C, or D) - stored for evaluation")
-    wasCorrect: bool = Field(..., description="Whether the answer was correct")
+    wasCorrect: Optional[bool] = Field(
+        None, 
+        description="Whether the answer was correct (None for first question event)"
+    )
     answeredAt: datetime = Field(default_factory=datetime.utcnow, description="When answered")
     
     class Config:
@@ -99,7 +107,8 @@ class QuizSession(BaseModel):
                         "question": "What is 2+2?",
                         "options": ["3", "4", "5", "6"],
                         "correctAnswer": "B",
-                        "difficulty": "easy"
+                        "difficulty": "easy",
+                        "chunkId": "chunk_xyz789"
                     }
                 ],
                 "questions": [
